@@ -626,7 +626,7 @@
   }
   
   function immediateExitToExterior() {
-    console.log('Immediate exit to exterior - creating dynamic body FIRST');
+    console.log('Seamless exit - switching from kinematic to dynamic (no collider removal)');
     
     // Get current interior state
     const currentInteriorPos = interiorPlayerBody.translation();
@@ -635,94 +635,72 @@
     const shipRot = shipBody.rotation();
     const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
     
-    // Use player's actual interior position transformed to world coordinates (no teleportation)
+    // Transform interior position to world coordinates
     const relativePos = new THREE.Vector3(currentInteriorPos.x, currentInteriorPos.y, currentInteriorPos.z);
     relativePos.applyQuaternion(shipQuat);
     
     const exteriorX = shipPos.x + relativePos.x;
-    const exteriorY = Math.max(shipPos.y + relativePos.y, 1); // Just ensure above ground level
+    const exteriorY = Math.max(shipPos.y + relativePos.y, 1);
     const exteriorZ = shipPos.z + relativePos.z;
     
-    console.log('Creating dynamic body at safe position:', { exteriorX, exteriorY, exteriorZ });
+    console.log('Converting kinematic body to dynamic at position:', { exteriorX, exteriorY, exteriorZ });
     
-    // CREATE DYNAMIC BODY FIRST - before removing kinematic
-    const newDynamicBodyDesc = RAPIER.RigidBodyDesc.dynamic()
+    // Create new dynamic body FIRST at the correct position
+    const dynamicBodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(exteriorX, exteriorY, exteriorZ)
       .setCanSleep(false)
       .setLinearDamping(2.0)
       .setAngularDamping(5.0)
       .lockRotations();
-    const newDynamicBody = exteriorWorld.createRigidBody(newDynamicBodyDesc);
+    const newDynamicBody = exteriorWorld.createRigidBody(dynamicBodyDesc);
     
-    // Create collider for new dynamic body immediately with same collision groups as original
+    // Create new collider for dynamic body immediately
     const capsuleRadius = 0.5;
     const capsuleHeight = 1.5;
-    const newDynamicColliderDesc = RAPIER.ColliderDesc.capsule(capsuleHeight / 2, capsuleRadius)
+    const newColliderDesc = RAPIER.ColliderDesc.capsule(capsuleHeight / 2, capsuleRadius)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
       .setFriction(0.8)
       .setRestitution(0.1);
-    const newDynamicCollider = exteriorWorld.createCollider(newDynamicColliderDesc, newDynamicBody);
+    const newCollider = exteriorWorld.createCollider(newColliderDesc, newDynamicBody);
     
-    console.log('Dynamic body and collider created, forcing physics update...');
+    console.log('New dynamic body and collider created simultaneously');
     
-    // FORCE IMMEDIATE PHYSICS PROCESSING
-    exteriorWorld.timestep = 0.016;
-    exteriorWorld.step(exteriorEventQueue);
-    
-    console.log('Physics step completed, body position:', newDynamicBody.translation());
-    
-    // Apply exit velocity to new body AFTER physics step
-    const exitVel = new THREE.Vector3(currentInteriorVel.x, currentInteriorVel.y, currentInteriorVel.z);
-    exitVel.applyQuaternion(shipQuat);
-    newDynamicBody.setLinvel({ x: exitVel.x, y: exitVel.y, z: exitVel.z }, true);
-    
-    // Force another physics step to ensure velocity is applied and collisions are detected
-    exteriorWorld.timestep = 0.016;
-    exteriorWorld.step(exteriorEventQueue);
-    
-    console.log('After velocity application - position:', newDynamicBody.translation());
-    console.log('After velocity application - velocity:', newDynamicBody.linvel());
-    
-    console.log('New dynamic body created with handle:', newDynamicBody.handle);
-    console.log('New collider created with handle:', newDynamicCollider.handle);
-    
-    // NOW remove old kinematic body (after new one is established)
-    console.log('Removing old kinematic body...');
+    // Now remove old kinematic body and collider
     if (playerCollider) {
-      // Change old collider to different group to prevent conflicts
       exteriorWorld.removeCollider(playerCollider, false);
     }
     exteriorWorld.removeRigidBody(playerBody);
     
-    // Switch references to new dynamic body IMMEDIATELY
+    // Switch to new body/collider atomically
     playerBody = newDynamicBody;
-    playerCollider = newDynamicCollider;
+    playerCollider = newCollider;
+    
+    // Apply transformed velocity immediately
+    const exitVel = new THREE.Vector3(currentInteriorVel.x, currentInteriorVel.y, currentInteriorVel.z);
+    exitVel.applyQuaternion(shipQuat);
+    playerBody.setLinvel({ x: exitVel.x, y: exitVel.y, z: exitVel.z }, true);
+    
+    // Switch state
     isInsideShip = false;
-    isExiting = false; // Reset exit lock
+    isExiting = false;
     
-    // Apply small upward impulse to test collision detection
-    playerBody.applyImpulse({ x: 0, y: 2, z: 0 }, true);
+    // Immediately test ground collision to verify it's working
+    const testRayStart = { x: exteriorX, y: exteriorY, z: exteriorZ };
+    const testRayDir = { x: 0, y: -1, z: 0 };
+    const testRay = new RAPIER.Ray(testRayStart, testRayDir);
+    const groundHit = exteriorWorld.castRay(testRay, 10, true);
     
-    // Force one more physics step to ensure collision is registered
-    exteriorWorld.timestep = 0.016;
-    exteriorWorld.step(exteriorEventQueue);
+    console.log('Seamlessly switched to dynamic body - type:', playerBody.bodyType());
+    console.log('Position:', playerBody.translation());
+    console.log('Velocity:', playerBody.linvel());
+    console.log('New collider handle:', newCollider.handle);
+    console.log('Ground detection test:', groundHit ? `Hit at ${groundHit.toi}` : 'NO GROUND FOUND');
     
-    console.log('Switched to dynamic body - type:', playerBody.bodyType());
-    console.log('Position after impulse test:', playerBody.translation());
-    console.log('Velocity after impulse test:', playerBody.linvel());
-    
-    // Immediate ground check
-    const rayStart = { x: exteriorX, y: exteriorY, z: exteriorZ };
-    const rayDir = { x: 0, y: -1, z: 0 };
-    const ray = new RAPIER.Ray(rayStart, rayDir);
-    const groundHit = exteriorWorld.castRay(ray, 10, true);
-    
-    if (groundHit) {
-      console.log('Ground confirmed at distance:', groundHit.toi);
-    } else {
-      console.log('WARNING: No ground detected - adjusting position');
-      // If no ground, spawn at known safe position
+    // If no ground found, emergency position adjustment
+    if (!groundHit) {
+      console.log('EMERGENCY: Moving player to safe ground position');
       playerBody.setTranslation({ x: 0, y: 5, z: 25 }, true);
+      playerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
     }
   }
 
@@ -954,11 +932,13 @@
   let shipTime = 0;
   
   function updateShip(deltaTime) {
-    const thrustPower = 150;
-    const liftPower = 200; // Counter-gravity force
-    const torquePower = 50;
+    const thrustPower = 500; // Increased thrust power
+    const liftPower = 600; // Increased lift power
+    const torquePower = 200; // Increased torque power
     
     console.log('Ship movement state:', shipMovement);
+    console.log('Delta time:', deltaTime);
+    console.log('Ship mass info - position:', shipBody.translation(), 'velocity:', shipBody.linvel());
     
     // Get ship's current rotation to apply thrust in local direction
     const shipRotation = shipBody.rotation();
@@ -966,8 +946,14 @@
     
     // Forward/backward thrust in ship's local forward direction
     let thrustZ = 0;
-    if (shipMovement.forward) thrustZ -= 1;
-    if (shipMovement.backward) thrustZ += 1;
+    if (shipMovement.forward) {
+      thrustZ -= 1;
+      console.log('Applying forward thrust');
+    }
+    if (shipMovement.backward) {
+      thrustZ += 1;
+      console.log('Applying backward thrust');
+    }
     
     if (thrustZ !== 0) {
       const forwardVector = new THREE.Vector3(0, 0, thrustZ).applyQuaternion(shipQuat);
@@ -976,25 +962,39 @@
         y: forwardVector.y * thrustPower * deltaTime,
         z: forwardVector.z * thrustPower * deltaTime
       };
+      console.log('Applying thrust impulse:', thrustImpulse);
+      console.log('Ship position before thrust:', shipBody.translation());
       shipBody.applyImpulse(thrustImpulse, true);
+      console.log('Ship velocity after thrust:', shipBody.linvel());
     }
     
     // Strong vertical lift (counter-gravity when up arrow pressed)
     if (shipMovement.up) {
       const strongLiftPower = 400; // Much stronger than gravity
       const liftImpulse = { x: 0, y: strongLiftPower * deltaTime, z: 0 };
-      shipBody.applyImpulse(liftImpulse, true);
       console.log('Applying strong lift impulse:', liftImpulse);
+      console.log('Ship position before lift:', shipBody.translation());
+      shipBody.applyImpulse(liftImpulse, true);
+      console.log('Ship velocity after lift:', shipBody.linvel());
     }
     
     // Yaw rotation (left/right arrows)
     let yawTorque = 0;
-    if (shipMovement.left) yawTorque += 1;
-    if (shipMovement.right) yawTorque -= 1;
+    if (shipMovement.left) {
+      yawTorque += 1;
+      console.log('Applying left yaw');
+    }
+    if (shipMovement.right) {
+      yawTorque -= 1;
+      console.log('Applying right yaw');
+    }
     
     if (yawTorque !== 0) {
       const torqueImpulse = { x: 0, y: yawTorque * torquePower * deltaTime, z: 0 };
+      console.log('Applying torque impulse:', torqueImpulse);
+      console.log('Ship rotation before torque:', shipBody.rotation());
       shipBody.applyTorqueImpulse(torqueImpulse, true);
+      console.log('Ship angular velocity after torque:', shipBody.angvel());
     }
     
     // Update ship mesh position and rotation to match physics
