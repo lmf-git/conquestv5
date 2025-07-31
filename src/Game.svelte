@@ -445,19 +445,19 @@
         break;
       case 'arrowup': 
         shipMovement.forward = true; 
-        console.log('Arrow up pressed');
+        console.log('Arrow UP pressed - forward thrust');
         break;
       case 'arrowdown': 
         shipMovement.backward = true; 
-        console.log('Arrow down pressed');
+        console.log('Arrow DOWN pressed - backward thrust');
         break;
       case 'arrowleft': 
         shipMovement.left = true; 
-        console.log('Arrow left pressed');
+        console.log('Arrow LEFT pressed - left yaw');
         break;
       case 'arrowright': 
         shipMovement.right = true; 
-        console.log('Arrow right pressed');
+        console.log('Arrow RIGHT pressed - right yaw');
         break;
       case 'q': 
         shipMovement.up = true; 
@@ -645,9 +645,10 @@
     
     console.log('Converting kinematic body to dynamic at position:', { exteriorX, exteriorY, exteriorZ });
     
-    // Create new dynamic body FIRST at the correct position
+    // Create new dynamic body FIRST at the correct position and rotation
     const dynamicBodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(exteriorX, exteriorY, exteriorZ)
+      .setRotation(shipRot.x, shipRot.y, shipRot.z, shipRot.w)
       .setCanSleep(false)
       .setLinearDamping(2.0)
       .setAngularDamping(5.0)
@@ -895,9 +896,11 @@
       };
       
       playerBody.setNextKinematicTranslation(exteriorPos);
+      playerBody.setNextKinematicRotation(shipRot);
       
-      // Position player mesh in real world interior (translated from static proxy)
+      // Position and rotate player mesh in real world interior (translated from static proxy)
       playerMesh.position.set(exteriorPos.x, exteriorPos.y, exteriorPos.z);
+      playerMesh.quaternion.set(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
       
       // Interior camera stays fixed
       interiorCamera.position.set(0, 4, 12);
@@ -932,9 +935,9 @@
   let shipTime = 0;
   
   function updateShip(deltaTime) {
-    const thrustPower = 500; // Increased thrust power
-    const liftPower = 600; // Increased lift power
-    const torquePower = 200; // Increased torque power
+    const thrustPower = 2000; // Much stronger thrust power
+    const liftPower = 2500; // Much stronger lift power  
+    const torquePower = 1000; // Much stronger torque power
     
     console.log('Ship movement state:', shipMovement);
     console.log('Delta time:', deltaTime);
@@ -957,24 +960,41 @@
     
     if (thrustZ !== 0) {
       const forwardVector = new THREE.Vector3(0, 0, thrustZ).applyQuaternion(shipQuat);
+      
+      // Try both force AND impulse for stronger effect
+      const thrustForce = {
+        x: forwardVector.x * thrustPower,
+        y: forwardVector.y * thrustPower,
+        z: forwardVector.z * thrustPower
+      };
       const thrustImpulse = {
         x: forwardVector.x * thrustPower * deltaTime,
         y: forwardVector.y * thrustPower * deltaTime,
         z: forwardVector.z * thrustPower * deltaTime
       };
-      console.log('Applying thrust impulse:', thrustImpulse);
+      
+      console.log('Applying thrust - Force:', thrustForce, 'Impulse:', thrustImpulse);
       console.log('Ship position before thrust:', shipBody.translation());
+      
+      // Apply both force and impulse for maximum effect
+      shipBody.addForce(thrustForce, true);
       shipBody.applyImpulse(thrustImpulse, true);
+      
       console.log('Ship velocity after thrust:', shipBody.linvel());
     }
     
-    // Strong vertical lift (counter-gravity when up arrow pressed)
+    // Strong vertical lift (counter-gravity when Q pressed)
     if (shipMovement.up) {
-      const strongLiftPower = 400; // Much stronger than gravity
-      const liftImpulse = { x: 0, y: strongLiftPower * deltaTime, z: 0 };
-      console.log('Applying strong lift impulse:', liftImpulse);
+      const liftForce = { x: 0, y: liftPower, z: 0 };
+      const liftImpulse = { x: 0, y: liftPower * deltaTime, z: 0 };
+      
+      console.log('Applying strong lift - Force:', liftForce, 'Impulse:', liftImpulse);
       console.log('Ship position before lift:', shipBody.translation());
+      
+      // Apply both force and impulse for maximum lift
+      shipBody.addForce(liftForce, true);
       shipBody.applyImpulse(liftImpulse, true);
+      
       console.log('Ship velocity after lift:', shipBody.linvel());
     }
     
@@ -990,10 +1010,16 @@
     }
     
     if (yawTorque !== 0) {
+      const torqueForce = { x: 0, y: yawTorque * torquePower, z: 0 };
       const torqueImpulse = { x: 0, y: yawTorque * torquePower * deltaTime, z: 0 };
-      console.log('Applying torque impulse:', torqueImpulse);
+      
+      console.log('Applying torque - Force:', torqueForce, 'Impulse:', torqueImpulse);
       console.log('Ship rotation before torque:', shipBody.rotation());
+      
+      // Apply both torque and torque impulse
+      shipBody.addTorque(torqueForce, true);
       shipBody.applyTorqueImpulse(torqueImpulse, true);
+      
       console.log('Ship angular velocity after torque:', shipBody.angvel());
     }
     
