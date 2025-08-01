@@ -14,6 +14,11 @@
   let transitionProgress = $state(0); // 0 = fully outside, 1 = fully inside
   let isTransitioning = $state(false);
   let isExiting = $state(false);
+  let isFirstPerson = $state(false);
+  let isPointerLocked = $state(false);
+  let mouseX = 0;
+  let mouseY = 0;
+  let cameraRotation = { yaw: 0, pitch: 0 };
   
   onMount(async () => {
     await RAPIER.init();
@@ -69,6 +74,9 @@
     window.addEventListener('resize', onWindowResize);
     document.addEventListener('keydown', handleKeyDown);
     document.addEventListener('keyup', handleKeyUp);
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('click', handleClick);
+    document.addEventListener('pointerlockchange', handlePointerLockChange);
     
     animate();
     
@@ -76,6 +84,9 @@
       window.removeEventListener('resize', onWindowResize);
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('keyup', handleKeyUp);
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('click', handleClick);
+      document.removeEventListener('pointerlockchange', handlePointerLockChange);
     };
   });
   
@@ -467,9 +478,66 @@
         shipMovement.down = true; 
         console.log('E pressed');
         break;
+      case 'o':
+        isFirstPerson = !isFirstPerson;
+        console.log('Camera switched to:', isFirstPerson ? 'First Person' : 'Third Person');
+        
+        // Reset mouse look rotation when switching to first person
+        if (isFirstPerson && !isPointerLocked) {
+          cameraRotation.yaw = 0;
+          cameraRotation.pitch = 0;
+        }
+        
+        // Exit pointer lock when switching to third person
+        if (!isFirstPerson && isPointerLocked) {
+          document.exitPointerLock();
+        }
+        break;
+      case 'escape':
+        if (isPointerLocked) {
+          document.exitPointerLock();
+        }
+        break;
     }
   }
   
+  function handleClick() {
+    if (!isPointerLocked && isFirstPerson) {
+      // Request pointer lock when clicking in first person mode
+      canvas.requestPointerLock();
+    }
+  }
+
+  function handlePointerLockChange() {
+    isPointerLocked = document.pointerLockElement === canvas;
+    console.log('Pointer lock:', isPointerLocked ? 'ON' : 'OFF');
+    
+    // Reset camera rotation when exiting pointer lock to prevent glitches
+    if (!isPointerLocked) {
+      cameraRotation.yaw = 0;
+      cameraRotation.pitch = 0;
+    }
+  }
+
+  function handleMouseMove(event) {
+    if (!isPointerLocked || !isFirstPerson) return;
+    
+    const sensitivity = 0.002;
+    const deltaX = event.movementX * sensitivity;
+    const deltaY = event.movementY * sensitivity;
+    
+    // Update camera rotation
+    cameraRotation.yaw += deltaX;
+    cameraRotation.pitch -= deltaY;
+    
+    // Clamp vertical rotation to prevent over-rotation
+    cameraRotation.pitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, cameraRotation.pitch));
+    
+    // Keep yaw in reasonable bounds (optional, helps prevent numerical drift)
+    while (cameraRotation.yaw > Math.PI) cameraRotation.yaw -= 2 * Math.PI;
+    while (cameraRotation.yaw < -Math.PI) cameraRotation.yaw += 2 * Math.PI;
+  }
+
   function handleKeyUp(event) {
     switch(event.key.toLowerCase()) {
       case 'w': movement.forward = false; break;
@@ -490,6 +558,72 @@
   }
   
   
+  function immediateEnterInterior() {
+    console.log('Instant entry to interior - converting dynamic to kinematic');
+    
+    // Maintain camera orientation during transition - no reset needed with improved rotation system
+    
+    // Get current exterior state
+    const currentExteriorPos = playerBody.translation();
+    const currentExteriorVel = playerBody.linvel();
+    const shipPos = shipBody.translation();
+    const shipRot = shipBody.rotation();
+    const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
+    
+    // Calculate relative position inside ship (exterior pos - ship pos, rotated by inverse ship rotation)
+    const worldRelativePos = new THREE.Vector3(
+      currentExteriorPos.x - shipPos.x,
+      currentExteriorPos.y - shipPos.y, 
+      currentExteriorPos.z - shipPos.z
+    );
+    
+    // Apply inverse ship rotation to get interior relative position
+    const shipQuatInverse = shipQuat.clone().invert();
+    worldRelativePos.applyQuaternion(shipQuatInverse);
+    
+    console.log('Interior relative position:', worldRelativePos);
+    
+    // Create new kinematic body FIRST at current exterior position
+    const kinematicBodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
+      .setTranslation(currentExteriorPos.x, currentExteriorPos.y, currentExteriorPos.z);
+    const newKinematicBody = exteriorWorld.createRigidBody(kinematicBodyDesc);
+    
+    // Create new collider for kinematic body
+    const capsuleRadius = 0.5;
+    const capsuleHeight = 1.5;
+    const newColliderDesc = RAPIER.ColliderDesc.capsule(capsuleHeight / 2, capsuleRadius);
+    const newCollider = exteriorWorld.createCollider(newColliderDesc, newKinematicBody);
+    
+    console.log('New kinematic body and collider created');
+    
+    // Remove old dynamic body and collider
+    if (playerCollider) {
+      exteriorWorld.removeCollider(playerCollider, false);
+    }
+    exteriorWorld.removeRigidBody(playerBody);
+    
+    // Switch to new kinematic body
+    playerBody = newKinematicBody;
+    playerCollider = newCollider;
+    isInsideShip = true;
+    
+    // Set interior player to the relative position with maintained velocity
+    interiorPlayerBody.setTranslation({ 
+      x: worldRelativePos.x, 
+      y: worldRelativePos.y, 
+      z: worldRelativePos.z 
+    }, true);
+    
+    // Transform velocity to interior coordinate system
+    const interiorVel = new THREE.Vector3(currentExteriorVel.x, currentExteriorVel.y, currentExteriorVel.z);
+    interiorVel.applyQuaternion(shipQuatInverse);
+    interiorPlayerBody.setLinvel({ x: interiorVel.x, y: interiorVel.y, z: interiorVel.z }, true);
+    
+    console.log('Instantly entered interior - kinematic body type:', playerBody.bodyType());
+    console.log('Interior player position:', interiorPlayerBody.translation());
+    console.log('Interior player velocity:', interiorPlayerBody.linvel());
+  }
+
   function enterShip() {
     console.log('Seamlessly entering ship - switching to interior physics control');
     isInsideShip = true;
@@ -628,6 +762,8 @@
   function immediateExitToExterior() {
     console.log('Seamless exit - switching from kinematic to dynamic (no collider removal)');
     
+    // Maintain camera orientation during transition - no reset needed with improved rotation system
+    
     // Get current interior state
     const currentInteriorPos = interiorPlayerBody.translation();
     const currentInteriorVel = interiorPlayerBody.linvel();
@@ -645,10 +781,9 @@
     
     console.log('Converting kinematic body to dynamic at position:', { exteriorX, exteriorY, exteriorZ });
     
-    // Create new dynamic body FIRST at the correct position and rotation
+    // Create new dynamic body FIRST at the correct position (no rotation inheritance from ship)
     const dynamicBodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(exteriorX, exteriorY, exteriorZ)
-      .setRotation(shipRot.x, shipRot.y, shipRot.z, shipRot.w)
       .setCanSleep(false)
       .setLinearDamping(2.0)
       .setAngularDamping(5.0)
@@ -676,20 +811,35 @@
     playerBody = newDynamicBody;
     playerCollider = newCollider;
     
-    // Apply transformed velocity immediately
+    // Ensure player is positioned safely above ground before applying velocity
+    const safeY = Math.max(exteriorY, 2.0); // Ensure at least 2 units above world origin
+    playerBody.setTranslation({ x: exteriorX, y: safeY, z: exteriorZ }, true);
+    
+    // Apply transformed velocity with reduced magnitude to prevent physics tunneling
     const exitVel = new THREE.Vector3(currentInteriorVel.x, currentInteriorVel.y, currentInteriorVel.z);
     exitVel.applyQuaternion(shipQuat);
+    
+    // Limit velocity to prevent tunneling through ground
+    const maxVel = 10; // Maximum velocity component
+    exitVel.x = Math.max(-maxVel, Math.min(maxVel, exitVel.x));
+    exitVel.y = Math.max(-maxVel, Math.min(maxVel, exitVel.y));
+    exitVel.z = Math.max(-maxVel, Math.min(maxVel, exitVel.z));
+    
     playerBody.setLinvel({ x: exitVel.x, y: exitVel.y, z: exitVel.z }, true);
     
     // Switch state
     isInsideShip = false;
     isExiting = false;
     
-    // Immediately test ground collision to verify it's working
-    const testRayStart = { x: exteriorX, y: exteriorY, z: exteriorZ };
+    // Force a physics step to ensure collider is properly registered
+    exteriorWorld.timestep = 1/60; // Small timestep
+    exteriorWorld.step(exteriorEventQueue);
+    
+    // Test ground collision to verify it's working
+    const testRayStart = { x: exteriorX, y: safeY, z: exteriorZ };
     const testRayDir = { x: 0, y: -1, z: 0 };
     const testRay = new RAPIER.Ray(testRayStart, testRayDir);
-    const groundHit = exteriorWorld.castRay(testRay, 10, true);
+    const groundHit = exteriorWorld.castRay(testRay, 15, true);
     
     console.log('Seamlessly switched to dynamic body - type:', playerBody.bodyType());
     console.log('Position:', playerBody.translation());
@@ -781,40 +931,49 @@
   }
   
   function checkGrounded() {
-    if (isInsideShip) {
-      const playerPos = interiorPlayerBody.translation();
-      const rayStart = { x: playerPos.x, y: playerPos.y - 0.65, z: playerPos.z };
-      const rayDir = { x: 0, y: -1, z: 0 };
-      const rayLength = 0.3;
-      
-      const ray = new RAPIER.Ray(rayStart, rayDir);
-      const hit = interiorWorld.castRay(ray, rayLength, true);
-      
-      isGrounded = hit !== null;
-      
-      // Debug interior physics (only every 60 frames to avoid spam)
-      if (Math.random() < 0.016) { // ~1/60 chance
-        console.log('Interior raycast:', {
-          playerPos,
-          rayStart,
-          rayLength,
-          hit: hit !== null,
-          hitDistance: hit ? hit.toi : null,
-          numBodies: interiorWorld.bodies.len(),
-          numColliders: interiorWorld.colliders.len(),
-          playerVelocity: interiorPlayerBody.linvel()
-        });
+    try {
+      if (isInsideShip && interiorPlayerBody) {
+        const playerPos = interiorPlayerBody.translation();
+        if (!playerPos) return;
+        
+        const rayStart = { x: playerPos.x, y: playerPos.y - 0.65, z: playerPos.z };
+        const rayDir = { x: 0, y: -1, z: 0 };
+        const rayLength = 0.3;
+        
+        const ray = new RAPIER.Ray(rayStart, rayDir);
+        const hit = interiorWorld.castRay(ray, rayLength, true);
+        
+        isGrounded = hit !== null;
+        
+        // Debug interior physics (only every 60 frames to avoid spam)
+        if (Math.random() < 0.016) { // ~1/60 chance
+          console.log('Interior raycast:', {
+            playerPos,
+            rayStart,
+            rayLength,
+            hit: hit !== null,
+            hitDistance: hit ? hit.toi : null,
+            numBodies: interiorWorld.bodies.len(),
+            numColliders: interiorWorld.colliders.len(),
+            playerVelocity: interiorPlayerBody.linvel()
+          });
+        }
+      } else if (!isInsideShip && playerBody) {
+        const playerPos = playerBody.translation();
+        if (!playerPos) return;
+        
+        const rayStart = { x: playerPos.x, y: playerPos.y - 0.65, z: playerPos.z };
+        const rayDir = { x: 0, y: -1, z: 0 };
+        const rayLength = 0.3;
+        
+        const ray = new RAPIER.Ray(rayStart, rayDir);
+        const hit = exteriorWorld.castRay(ray, rayLength, true);
+        
+        isGrounded = hit !== null;
       }
-    } else {
-      const playerPos = playerBody.translation();
-      const rayStart = { x: playerPos.x, y: playerPos.y - 0.65, z: playerPos.z };
-      const rayDir = { x: 0, y: -1, z: 0 };
-      const rayLength = 0.3;
-      
-      const ray = new RAPIER.Ray(rayStart, rayDir);
-      const hit = exteriorWorld.castRay(ray, rayLength, true);
-      
-      isGrounded = hit !== null;
+    } catch (error) {
+      console.warn('Error checking grounded state:', error);
+      isGrounded = false; // Safe fallback
     }
   }
   
@@ -823,17 +982,24 @@
     const airSpeed = 1.5; // Slower movement in air
     const jumpSpeed = 7;
     
-    checkGrounded();
-    
-    let velocity, currentPlayerBody;
-    
-    if (isInsideShip) {
-      currentPlayerBody = interiorPlayerBody;
-      velocity = interiorPlayerBody.linvel();
-    } else {
-      currentPlayerBody = playerBody;
-      velocity = playerBody.linvel();
-    }
+    try {
+      checkGrounded();
+      
+      let velocity, currentPlayerBody;
+      
+      if (isInsideShip) {
+        currentPlayerBody = interiorPlayerBody;
+        velocity = interiorPlayerBody.linvel();
+      } else {
+        currentPlayerBody = playerBody;
+        velocity = playerBody.linvel();
+      }
+      
+      // Safety check - make sure we have valid physics bodies
+      if (!currentPlayerBody || !velocity) {
+        console.warn('Invalid player body or velocity, skipping update');
+        return;
+      }
     
     // Reset canJump when grounded
     if (isGrounded && velocity.y < 1.0) {
@@ -902,13 +1068,48 @@
       playerMesh.position.set(exteriorPos.x, exteriorPos.y, exteriorPos.z);
       playerMesh.quaternion.set(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
       
-      // Interior camera stays fixed
-      interiorCamera.position.set(0, 4, 12);
-      interiorCamera.lookAt(0, 1.5, 0);
+      // Interior camera follows player with mouse look
+      if (isFirstPerson) {
+        // First person interior view - camera at proxy player position with mouse look
+        // Camera positioned at player head height (1.5 units above player center)
+        interiorCamera.position.set(pos.x, pos.y + 1.5, pos.z);
+        
+        // Apply mouse look rotation directly in interior space (not affected by ship rotation)
+        // This gives proper FPS control regardless of ship orientation
+        const mouseLookEuler = new THREE.Euler(cameraRotation.pitch, cameraRotation.yaw, 0, 'YXZ');
+        const mouseLookQuat = new THREE.Quaternion().setFromEuler(mouseLookEuler);
+        interiorCamera.quaternion.copy(mouseLookQuat);
+      } else {
+        // Third person interior view - fixed camera (zoomed out for better overview)
+        interiorCamera.position.set(0, 6, 18);
+        interiorCamera.lookAt(0, 1.5, 0);
+      }
       
       // Exterior camera follows real world player representation when inside ship
-      exteriorCamera.position.set(exteriorPos.x, exteriorPos.y + 5, exteriorPos.z + 10);
-      exteriorCamera.lookAt(exteriorPos.x, exteriorPos.y + 1, exteriorPos.z);
+      if (isFirstPerson) {
+        // First person - camera at player head position with ship-relative orientation
+        // Position camera at head height relative to ship's up direction
+        const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
+        const shipUpOffset = new THREE.Vector3(0, 1.5, 0).applyQuaternion(shipQuat);
+        exteriorCamera.position.set(
+          exteriorPos.x + shipUpOffset.x, 
+          exteriorPos.y + shipUpOffset.y, 
+          exteriorPos.z + shipUpOffset.z
+        );
+        
+        // Camera should be oriented relative to ship's coordinate system
+        // Player feels upright relative to ship floor, not world floor
+        const mouseLookEuler = new THREE.Euler(cameraRotation.pitch, cameraRotation.yaw, 0, 'YXZ');
+        const mouseLookQuat = new THREE.Quaternion().setFromEuler(mouseLookEuler);
+        
+        // Combine ship rotation with mouse look: ship orientation first, then mouse look
+        const combinedQuat = shipQuat.clone().multiply(mouseLookQuat);
+        exteriorCamera.quaternion.copy(combinedQuat);
+      } else {
+        // Third person - camera behind and above player
+        exteriorCamera.position.set(exteriorPos.x, exteriorPos.y + 5, exteriorPos.z + 10);
+        exteriorCamera.lookAt(exteriorPos.x, exteriorPos.y + 1, exteriorPos.z);
+      }
     } else {
       // Position player mesh for exterior view
       playerMesh.position.set(pos.x, pos.y, pos.z);
@@ -917,31 +1118,37 @@
       debugPlayerMesh.visible = false;
       
       // Update cameras - exterior camera follows player position
-      // During exit transition, make sure we use the correct player body position
-      const cameraTargetPos = isTransitioning ? playerBody.translation() : pos;
-      exteriorCamera.position.set(cameraTargetPos.x, cameraTargetPos.y + 5, cameraTargetPos.z + 10);
-      exteriorCamera.lookAt(cameraTargetPos.x, cameraTargetPos.y + 1, cameraTargetPos.z);
-      
-      if (isTransitioning) {
-        console.log('Transitioning - exterior camera following playerBody at:', cameraTargetPos);
+      if (isFirstPerson) {
+        // First person - camera at player head position with mouse look
+        exteriorCamera.position.set(pos.x, pos.y + 1.5, pos.z);
+        
+        // Apply mouse look rotation directly (no ship rotation interference outside)
+        const mouseLookEuler = new THREE.Euler(cameraRotation.pitch, cameraRotation.yaw, 0, 'YXZ');
+        const mouseLookQuat = new THREE.Quaternion().setFromEuler(mouseLookEuler);
+        exteriorCamera.quaternion.copy(mouseLookQuat);
+      } else {
+        // Third person - camera behind and above player
+        exteriorCamera.position.set(pos.x, pos.y + 5, pos.z + 10);
+        exteriorCamera.lookAt(pos.x, pos.y + 1, pos.z);
       }
     }
     
     // Update debug states
     playerPosition = { x: Math.round(pos.x * 100) / 100, y: Math.round(pos.y * 100) / 100, z: Math.round(pos.z * 100) / 100 };
     playerVelocity = { x: Math.round(velocity.x * 100) / 100, y: Math.round(velocity.y * 100) / 100, z: Math.round(velocity.z * 100) / 100 };
+    
+    } catch (error) {
+      console.warn('Error updating player:', error);
+    }
   }
   
-  let shipTime = 0;
   
   function updateShip(deltaTime) {
     const thrustPower = 2000; // Much stronger thrust power
     const liftPower = 2500; // Much stronger lift power  
     const torquePower = 1000; // Much stronger torque power
     
-    console.log('Ship movement state:', shipMovement);
-    console.log('Delta time:', deltaTime);
-    console.log('Ship mass info - position:', shipBody.translation(), 'velocity:', shipBody.linvel());
+    try {
     
     // Get ship's current rotation to apply thrust in local direction
     const shipRotation = shipBody.rotation();
@@ -1034,6 +1241,10 @@
       shipInteriorProxy.position.set(0, 0, 0);
       interiorCamera.lookAt(0, 1.5, 0);
     }
+    
+    } catch (error) {
+      console.warn('Error updating ship:', error);
+    }
   }
   
   let lastTime = 0;
@@ -1053,52 +1264,62 @@
     }
     
     if (deltaTime > 0) {
-      // Step exterior world
-      exteriorWorld.timestep = deltaTime;
-      exteriorWorld.step(exteriorEventQueue);
-      
-      // Process exterior collision events for ship entry detection
-      exteriorEventQueue.drainCollisionEvents((handle1, handle2, started) => {
-        if (started && !isInsideShip && !isTransitioning) {
-          const collider1 = exteriorWorld.getCollider(handle1);
-          const collider2 = exteriorWorld.getCollider(handle2);
-          
-          // Check if one of the colliders is the exterior player
-          if ((collider1 === playerCollider || collider2 === playerCollider)) {
-            const otherCollider = collider1 === playerCollider ? collider2 : collider1;
-            
-            // Check if colliding with door sensor
-            if (otherCollider.isSensor()) {
-              const playerPos = playerBody.translation();
-              console.log('Exterior player detected at door sensor at position:', playerPos);
-              console.log('Starting entry transition');
-              startEnterTransition();
+      try {
+        // Step exterior world with proper timestep
+        exteriorWorld.timestep = deltaTime;
+        exteriorWorld.step(exteriorEventQueue);
+        
+        // Process exterior collision events for ship entry detection
+        exteriorEventQueue.drainCollisionEvents((handle1, handle2, started) => {
+          if (started && !isInsideShip && !isExiting) {
+            try {
+              const collider1 = exteriorWorld.getCollider(handle1);
+              const collider2 = exteriorWorld.getCollider(handle2);
+              
+              // Check if one of the colliders is the exterior player
+              if ((collider1 === playerCollider || collider2 === playerCollider)) {
+                const otherCollider = collider1 === playerCollider ? collider2 : collider1;
+                
+                // Check if colliding with door sensor
+                if (otherCollider && otherCollider.isSensor()) {
+                  const playerPos = playerBody.translation();
+                  console.log('INSTANT ENTRY TRIGGERED - Exterior player at door sensor:', playerPos);
+                  immediateEnterInterior();
+                }
+              }
+            } catch (error) {
+              console.warn('Error processing exterior collision events:', error);
             }
           }
+        });
+        
+        // Step interior world with proper timestep
+        interiorWorld.timestep = deltaTime;
+        interiorWorld.step(interiorEventQueue);
+        
+        // Check for automatic exit based on momentum and clear path
+        if (isInsideShip && !isTransitioning) {
+          checkAutoExit();
         }
-      });
-      
-      // Step interior world
-      interiorWorld.timestep = deltaTime;
-      interiorWorld.step(interiorEventQueue);
-      
-      // Check for automatic exit based on momentum and clear path
-      if (isInsideShip && !isTransitioning) {
-        checkAutoExit();
+        
+        // Process interior collision events for sensor detection
+        interiorEventQueue.drainCollisionEvents(() => {
+          // Remove sensor-based exit detection - now using momentum + raycast system
+        });
+        
+        // Update transition progress
+        if (isTransitioning) {
+          updateTransition(deltaTime);
+        }
+        
+        updatePlayer(deltaTime);
+        updateShip(deltaTime);
+        
+      } catch (error) {
+        console.error('Critical physics error:', error);
+        // Skip this frame to prevent cascade failures
+        return;
       }
-      
-      // Process interior collision events for sensor detection
-      interiorEventQueue.drainCollisionEvents((handle1, handle2, started) => {
-        // Remove sensor-based exit detection - now using momentum + raycast system
-      });
-      
-      // Update transition progress
-      if (isTransitioning) {
-        updateTransition(deltaTime);
-      }
-      
-      updatePlayer(deltaTime);
-      updateShip(deltaTime);
     }
     
     renderDualView();
@@ -1166,9 +1387,10 @@
 <canvas bind:this={canvas}></canvas>
 
 <div class="ui">
-  <p>WASD: Move | Space: Jump | Arrow Keys: Fly Ship | Q/E: Up/Down</p>
+  <p>WASD: Move | Space: Jump | Arrow Keys: Fly Ship | Q/E: Up/Down | O: Toggle Camera | Click: Pointer Lock | ESC: Exit Lock</p>
   <p>Status: {isInsideShip ? 'Inside Ship' : 'Outside Ship'}</p>
   <p>Movement: {movementStatus}</p>
+  <p>Camera: {isFirstPerson ? 'First Person' : 'Third Person'} | Pointer Lock: {isPointerLocked ? 'ON' : 'OFF'}</p>
 </div>
 
 <div class="camera-labels">
@@ -1211,6 +1433,17 @@
     <span class="value">{isInsideShip ? 'YES' : 'NO'}</span>
   </div>
 </div>
+
+<!-- Crosshair for FPS mode -->
+{#if isFirstPerson && isPointerLocked}
+<div class="crosshair">
+  <div class="crosshair-dot"></div>
+  <div class="crosshair-lines">
+    <div class="crosshair-line horizontal"></div>
+    <div class="crosshair-line vertical"></div>
+  </div>
+</div>
+{/if}
 
 <style>
   canvas {
@@ -1302,5 +1535,52 @@
   .camera-label.right {
     right: 20px;
     color: #00aaff;
+  }
+  
+  .crosshair {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 1000;
+    pointer-events: none;
+  }
+  
+  .crosshair-dot {
+    width: 4px;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.8);
+    border-radius: 50%;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 2px rgba(0, 0, 0, 0.8);
+  }
+  
+  .crosshair-lines {
+    position: relative;
+  }
+  
+  .crosshair-line {
+    background: rgba(255, 255, 255, 0.6);
+    position: absolute;
+    box-shadow: 0 0 1px rgba(0, 0, 0, 0.8);
+  }
+  
+  .crosshair-line.horizontal {
+    width: 20px;
+    height: 1px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+  
+  .crosshair-line.vertical {
+    width: 1px;
+    height: 20px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
   }
 </style>
