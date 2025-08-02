@@ -700,14 +700,6 @@
     frontWallTop.position.set(0, stationHeight - (stationHeight - dockingBayHeight) / 2, stationLength / 2 - wallThickness / 2);
     stationInteriorProxy.add(frontWallTop);
     
-    // Add some interior structures (platforms, etc.)
-    const platformMaterial = new THREE.MeshStandardMaterial({ color: 0x777777 });
-    const platform = new THREE.Mesh(
-      new THREE.BoxGeometry(60, 4, 80),
-      platformMaterial
-    );
-    platform.position.set(-40, 4, -50);
-    stationInteriorProxy.add(platform);
     
     // Create ship proxy for station interior view
     createStationShipProxy();
@@ -1598,6 +1590,9 @@
     stationShipBody.setTranslation({ x: relativePos.x, y: relativePos.y, z: relativePos.z }, true);
     stationShipBody.setLinvel({ x: currentShipVel.x, y: currentShipVel.y, z: currentShipVel.z }, true);
     
+    console.log('Ship docked at station-relative position:', { x: relativePos.x, y: relativePos.y, z: relativePos.z });
+    console.log('Ship floor will be at Y:', (relativePos.y - 2.0).toFixed(2), '(station floor at Y=1.0)');
+    
     // Transform ship rotation to station-relative coordinates
     const shipQuat = new THREE.Quaternion(currentShipRot.x, currentShipRot.y, currentShipRot.z, currentShipRot.w);
     const stationRelativeRotation = shipQuat.multiply(stationQuatInverse);
@@ -1830,12 +1825,13 @@
   }
 
   function exitShip() {
-    console.log('Seamlessly exiting ship');
+    console.log('=== PLAYER EXITING SHIP ===');
     console.log('Ship docking status check: isShipDocked =', isShipDocked);
-    console.log('Ship position:', shipBody.translation());
+    console.log('Ship exterior body position:', shipBody.translation());
     if (stationShipBody) {
       console.log('Station ship body position:', stationShipBody.translation());
     }
+    console.log('Player current location: isInsideStation =', isInsideStation);
     
     isInsideShip = false;
     
@@ -1911,8 +1907,8 @@
       relativePos.applyQuaternion(shipQuat);
       
       // Position player in station relative to docked ship
-      // Place player on station floor (Y=1) near ship door, not at ship's Y position
-      const stationFloorY = 1.5; // Slightly above station floor to prevent clipping
+      // Place player on station floor - station floor top surface is at Y=0.4, player capsule height is 1.5
+      const stationFloorY = 0.4 + 1.5/2 + 0.5; // Floor surface + half capsule height + extra clearance = 1.65
       const stationPlayerPos = {
         x: stationShipPos.x + relativePos.x,
         y: stationFloorY, // Always place on station floor, not ship height
@@ -2105,7 +2101,8 @@
   }
   
   function exitStation() {
-    console.log('Seamlessly exiting station');
+    console.log('=== PLAYER EXITING STATION ===');
+    console.log('Current player state: isInsideStation =', isInsideStation, ', isInsideShip =', isInsideShip);
     isInsideStation = false;
     
     // Get current station player state
@@ -2191,29 +2188,14 @@
       console.log('Player is grounded:', isGrounded);
     }, 100);
     
-    // Only undock ship if it's outside the docking bay area
+    // IMPORTANT: Do NOT undock ship when player exits station
+    // Ship docking/undocking should be independent of player location
+    // The ship stays docked as long as it's physically in the docking bay
+    console.log('Player exiting station - ship docking remains independent of player state');
+    console.log('Ship docking status: isShipDocked =', isShipDocked);
+    
     if (isShipDocked) {
-      const shipPos = shipBody.translation();
-      const stationPos = stationBody.translation();
-      const shipRelativeToStation = {
-        x: shipPos.x - stationPos.x,
-        y: shipPos.y - stationPos.y,
-        z: shipPos.z - stationPos.z
-      };
-      
-      const dockingBayWidth = 60, dockingBayHeight = 30;
-      const stationLength = 250;
-      // Check if ship is still in docking bay area
-      const isShipInDockingBay = Math.abs(shipRelativeToStation.x) < dockingBayWidth/2 && 
-                                shipRelativeToStation.y > 0 && shipRelativeToStation.y < dockingBayHeight &&
-                                shipRelativeToStation.z > stationLength/2 - 40 && shipRelativeToStation.z < stationLength/2;
-      
-      if (!isShipInDockingBay) {
-        console.log('Player exiting station - ship outside docking bay, undocking ship');
-        undockShip();
-      } else {
-        console.log('Player exiting station - ship still in docking bay, keeping docked');
-      }
+      console.log('Ship remains docked in station - player location does not affect ship docking');
     }
     
     // Reset exiting flag
@@ -2544,6 +2526,14 @@
       shipBody.setTranslation(worldShipPos, true);
       shipBody.setRotation(stationShipRot, true);
       
+      // Debug: Track ship position sync (only log occasionally to avoid spam)
+      if (Math.random() < 0.001) { // Log ~0.1% of frames
+        console.log('SYNC: Updating exterior ship position from station ship');
+        console.log('  Station ship pos:', stationShipPos);
+        console.log('  Station pos:', stationPos);
+        console.log('  World ship pos:', worldShipPos);
+      }
+      
       // Update ship mesh to match
       shipMesh.position.set(worldShipPos.x, worldShipPos.y, worldShipPos.z);
       shipMesh.quaternion.set(stationShipRot.x, stationShipRot.y, stationShipRot.z, stationShipRot.w);
@@ -2833,7 +2823,7 @@
         console.log('  Position match?', Math.abs(stationShipPos.x - stationShipProxy.position.x) < 0.1 && 
                                          Math.abs(stationShipPos.y - stationShipProxy.position.y) < 0.1 && 
                                          Math.abs(stationShipPos.z - stationShipProxy.position.z) < 0.1);
-        console.log('  Ship floor physics at Y:', (stationShipPos.y - 0.4).toFixed(2), '(station floor at Y=1)');
+        console.log('  Ship floor physics at Y:', (stationShipPos.y - 2.0).toFixed(2), '(station floor at Y=1)');
         console.log('  Ship bounds: X±10, Y:', (stationShipPos.y - 1).toFixed(2), 'to', (stationShipPos.y + 6).toFixed(2), ', Z±15');
         
         // Check if ship is positioned correctly relative to station floor
@@ -3011,32 +3001,79 @@
           startShipDockingTransition();
         }
         
-        // Position-based ship docking check (runs every frame)
+        // Position-based ship docking/undocking check (runs every frame)
+        let shipPos, shipRelativeToStation, isShipInDockingBay;
+        const stationPos = stationBody.translation();
+        // Station interior bounds - use full interior space, not just docking bay entrance
+        const stationWidth = 200, stationHeight = 60, stationLength = 250;
+        const wallThickness = 2.0;
+        
+        if (isShipDocked) {
+          // When docked, use station ship body position (already in station coordinates)
+          const stationShipPos = stationShipBody.translation();
+          shipRelativeToStation = {
+            x: stationShipPos.x,
+            y: stationShipPos.y,
+            z: stationShipPos.z
+          };
+          
+          // Convert to world coordinates for consistency (though not needed for bounds check)
+          const stationRot = stationBody.rotation();
+          const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
+          const relativeShipPos = new THREE.Vector3(stationShipPos.x, stationShipPos.y, stationShipPos.z);
+          relativeShipPos.applyQuaternion(stationQuat);
+          
+          shipPos = {
+            x: stationPos.x + relativeShipPos.x,
+            y: stationPos.y + relativeShipPos.y,
+            z: stationPos.z + relativeShipPos.z
+          };
+        } else {
+          // When not docked, use exterior ship body position
+          shipPos = shipBody.translation();
+          shipRelativeToStation = {
+            x: shipPos.x - stationPos.x,
+            y: shipPos.y - stationPos.y,
+            z: shipPos.z - stationPos.z
+          };
+        }
+        
+        // Check if ship is inside station interior bounds (full station space)
+        // Station interior bounds: X±99, Y(1-59), Z±124 (accounting for wall thickness)
+        const xInBounds = Math.abs(shipRelativeToStation.x) < (stationWidth/2 - wallThickness);
+        const yInBounds = shipRelativeToStation.y > wallThickness && shipRelativeToStation.y < (stationHeight - wallThickness);
+        const zInBounds = Math.abs(shipRelativeToStation.z) < (stationLength/2 - wallThickness);
+        
+        isShipInDockingBay = xInBounds && yInBounds && zInBounds;
+        
+        // Debug logging when docked to see position relative to station interior
+        if (isShipDocked && frameCount % 60 === 0) { // Every second
+          console.log('🔍 STATION INTERIOR BOUNDS CHECK (when docked):');
+          console.log('  Ship station-relative pos:', { x: shipRelativeToStation.x.toFixed(2), y: shipRelativeToStation.y.toFixed(2), z: shipRelativeToStation.z.toFixed(2) });
+          console.log('  Station interior bounds: X±98, Y(2-58), Z±123');
+          console.log('  X in bounds (±98):', xInBounds, '- value:', shipRelativeToStation.x.toFixed(2));
+          console.log('  Y in bounds (2-58):', yInBounds, '- value:', shipRelativeToStation.y.toFixed(2));
+          console.log('  Z in bounds (±123):', zInBounds, '- value:', shipRelativeToStation.z.toFixed(2));
+          console.log('  Overall in station:', isShipInDockingBay);
+        }
+        
         if (!isShipDocked && !pendingShipDocking) {
+          // Ship docking logic
           const currentTime = Date.now();
           const timeSinceUndock = currentTime - lastUndockTime;
           
-          // Check if ship is inside docking bay bounds with cooldown
-          if (timeSinceUndock > 2000) { // 2 second cooldown after undocking
-            const shipPos = shipBody.translation();
-            const stationPos = stationBody.translation();
-            const shipRelativeToStation = {
-              x: shipPos.x - stationPos.x,
-              y: shipPos.y - stationPos.y,
-              z: shipPos.z - stationPos.z
-            };
-            
-            const dockingBayWidth = 60, dockingBayHeight = 30;
-            const stationLength = 250;
-            // Check if ship is in docking bay area (front part of station)
-            const isShipInDockingBay = Math.abs(shipRelativeToStation.x) < dockingBayWidth/2 && 
-                                      shipRelativeToStation.y > 0 && shipRelativeToStation.y < dockingBayHeight &&
-                                      shipRelativeToStation.z > stationLength/2 - 40 && shipRelativeToStation.z < stationLength/2;
-            
-            if (isShipInDockingBay) {
-              console.log('SHIP DOCKING DETECTED (position-based) - Deferring docking until after physics step');
-              pendingShipDocking = true;
-            }
+          // Check if ship should dock with cooldown
+          if (timeSinceUndock > 2000 && isShipInDockingBay) { // 2 second cooldown after undocking
+            console.log('SHIP DOCKING DETECTED (position-based) - Deferring docking until after physics step');
+            pendingShipDocking = true;
+          }
+        } else if (isShipDocked) {
+          // Ship undocking logic - check if ship has moved outside docking bay
+          if (!isShipInDockingBay) {
+            console.log('SHIP UNDOCKING DETECTED (position-based) - Ship moved outside docking bay');
+            console.log('  Ship station-relative pos:', { x: shipRelativeToStation.x.toFixed(2), y: shipRelativeToStation.y.toFixed(2), z: shipRelativeToStation.z.toFixed(2) });
+            console.log('  Ship world pos:', { x: shipPos.x.toFixed(2), y: shipPos.y.toFixed(2), z: shipPos.z.toFixed(2) });
+            undockShip();
           }
         }
 
