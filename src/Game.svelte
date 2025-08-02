@@ -606,21 +606,6 @@
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     exteriorWorld.createCollider(dockingSensorCollider, stationBody);
     
-    // Add debug visualization for docking sensor
-    const dockingSensorGeometry = new THREE.BoxGeometry(
-      (dockingBayWidth / 2 - 1) * 2,
-      (dockingBayHeight / 2 - 1) * 2,
-      10
-    );
-    const dockingSensorMaterial = new THREE.MeshBasicMaterial({
-      color: 0x00ff00,
-      transparent: true,
-      opacity: 0.3,
-      wireframe: true
-    });
-    const dockingSensorMesh = new THREE.Mesh(dockingSensorGeometry, dockingSensorMaterial);
-    dockingSensorMesh.position.set(0, dockingBayHeight / 2, stationLength / 2 - 10);
-    stationGroup.add(dockingSensorMesh);
     
     // Create player entry sensor for direct station access
     const stationEntrySensorCollider = RAPIER.ColliderDesc.cuboid(3, 3, 0.5)
@@ -1528,6 +1513,28 @@
     
     console.log('Entered station - station player position:', stationPlayerBody.translation());
     
+    // Check if ship needs auto re-docking when player enters station
+    if (!isShipDocked) {
+      const shipPos = shipBody.translation();
+      const shipRelativeToStation = {
+        x: shipPos.x - stationPos.x,
+        y: shipPos.y - stationPos.y,
+        z: shipPos.z - stationPos.z
+      };
+      
+      const dockingBayWidth = 60, dockingBayHeight = 30;
+      const stationLength = 250;
+      // Check if ship is in docking bay area
+      const isShipInDockingBay = Math.abs(shipRelativeToStation.x) < dockingBayWidth/2 && 
+                                shipRelativeToStation.y > 0 && shipRelativeToStation.y < dockingBayHeight &&
+                                shipRelativeToStation.z > stationLength/2 - 40 && shipRelativeToStation.z < stationLength/2;
+      
+      if (isShipInDockingBay) {
+        console.log('Ship found inside docking bay on station entry - auto re-docking');
+        smoothDockShip();
+      }
+    }
+    
     // Reset entering flag
     isEntering = false;
   }
@@ -1545,51 +1552,30 @@
   function smoothDockShip() {
     if (isShipDocked) return; // Prevent multiple docking calls
     
-    console.log('Immediate ship docking - converting exterior ship to kinematic, activating station ship physics');
+    console.log('Seamlessly docking ship - switching to station physics control');
+    isShipDocked = true;
     
-    // Get current ship state directly (no transition data needed)
+    // Get current ship state
     const currentShipPos = shipBody.translation();
     const currentShipVel = shipBody.linvel();
     const currentShipRot = shipBody.rotation();
-    
-    // Store current mesh position to prevent visual glitching
-    const currentMeshPos = { x: shipMesh.position.x, y: shipMesh.position.y, z: shipMesh.position.z };
-    const currentMeshRot = { x: shipMesh.quaternion.x, y: shipMesh.quaternion.y, z: shipMesh.quaternion.z, w: shipMesh.quaternion.w };
-    
-    console.log('Using current ship state for immediate docking:', {
-      pos: { x: currentShipPos.x.toFixed(2), y: currentShipPos.y.toFixed(2), z: currentShipPos.z.toFixed(2) }
-    });
     const stationPos = stationBody.translation();
     const stationRot = stationBody.rotation();
+    
+    // Calculate relative position inside station (ship pos - station pos)
+    const relativeX = currentShipPos.x - stationPos.x;
+    const relativeY = currentShipPos.y - stationPos.y;
+    const relativeZ = currentShipPos.z - stationPos.z;
+    
+    // Apply inverse station rotation for interior coordinates
     const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
-    
-    // Calculate relative position inside station (similar to player entry logic)
-    const worldRelativePos = new THREE.Vector3(
-      currentShipPos.x - stationPos.x,
-      currentShipPos.y - stationPos.y, 
-      currentShipPos.z - stationPos.z
-    );
-    
-    console.log('Ship position calculation:', {
-      shipPos: { x: currentShipPos.x.toFixed(2), y: currentShipPos.y.toFixed(2), z: currentShipPos.z.toFixed(2) },
-      stationPos: { x: stationPos.x.toFixed(2), y: stationPos.y.toFixed(2), z: stationPos.z.toFixed(2) },
-      worldRelative: { x: worldRelativePos.x.toFixed(2), y: worldRelativePos.y.toFixed(2), z: worldRelativePos.z.toFixed(2) }
-    });
-    
-    // Apply inverse station rotation to get station interior relative position
     const stationQuatInverse = stationQuat.clone().invert();
-    worldRelativePos.applyQuaternion(stationQuatInverse);
+    const relativePos = new THREE.Vector3(relativeX, relativeY, relativeZ);
+    relativePos.applyQuaternion(stationQuatInverse);
     
-    console.log('Ship entering station at natural interior position (after rotation):', {
-      x: worldRelativePos.x.toFixed(2), 
-      y: worldRelativePos.y.toFixed(2), 
-      z: worldRelativePos.z.toFixed(2)
-    });
-    console.log('Station interior bounds: Floor Y=1, Ceiling Y=59, Walls X=±99, Z=±124');
-    console.log('Ship body type before docking:', shipBody.bodyType());
+    console.log('Switching control - relative position:', { x: relativePos.x.toFixed(2), y: relativePos.y.toFixed(2), z: relativePos.z.toFixed(2) });
     
     // Convert exterior ship to kinematic (synchronized by station simulation)
-    // First, remove all colliders attached to the ship
     const numColliders = shipBody.numColliders();
     for (let i = numColliders - 1; i >= 0; i--) {
       const collider = shipBody.collider(i);
@@ -1600,81 +1586,34 @@
     
     exteriorWorld.removeRigidBody(shipBody);
     
-    // Create new kinematic ship body in exterior world
     const kinematicShipBodyDesc = RAPIER.RigidBodyDesc.kinematicPositionBased()
       .setTranslation(currentShipPos.x, currentShipPos.y, currentShipPos.z)
       .setRotation(currentShipRot);
     shipBody = exteriorWorld.createRigidBody(kinematicShipBodyDesc);
     
-    // Immediately restore mesh position to prevent visual glitching during body recreation
-    shipMesh.position.set(currentMeshPos.x, currentMeshPos.y, currentMeshPos.z);
-    shipMesh.quaternion.set(currentMeshRot.x, currentMeshRot.y, currentMeshRot.z, currentMeshRot.w);
+    // Reactivate station ship body as dynamic
+    stationShipBody.setBodyType(RAPIER.RigidBodyType.Dynamic);
     
-    // NO COLLIDERS for exterior kinematic ship when docked!
-    // All collision detection happens in station world with stationShipBody
-    console.log('Ship docked - exterior body is kinematic with NO colliders (station world handles physics)');
+    // Set station ship to relative position and maintain velocity
+    stationShipBody.setTranslation({ x: relativePos.x, y: relativePos.y, z: relativePos.z }, true);
+    stationShipBody.setLinvel({ x: currentShipVel.x, y: currentShipVel.y, z: currentShipVel.z }, true);
     
-    // Define ship dimensions for consistency
-    const shipWidth = 20, shipHeight = 6, shipLength = 30, wallThickness = 0.4;
-    const doorWidth = 4, doorHeight = 4;
-    
-    // Ship docks at its natural entry position - no artificial constraints
-    console.log('Ship docking at natural position:', { 
-      x: worldRelativePos.x.toFixed(2), 
-      y: worldRelativePos.y.toFixed(2), 
-      z: worldRelativePos.z.toFixed(2) 
-    });
-    console.log('Station docking position adjustment:', {
-      naturalY: worldRelativePos.y.toFixed(2),
-      naturalZ: worldRelativePos.z.toFixed(2),
-      finalY: 'calculated below',
-      safeInteriorZ: 'calculated below',
-      willCollideWithFloor: worldRelativePos.y < 1.0
-    });
-    
-    // Activate ship physics in station world at natural position
-    // Use the natural entry position (worldRelativePos) like player entry does
-    // But ensure ship floor doesn't penetrate station floor AND ship is properly inside station
-    const shipFloorOffset = -0.4; // Ship floor is 0.4 below ship body
-    const stationFloorTop = 0.4; // Station floor top surface
-    const minShipY = stationFloorTop - shipFloorOffset + 0.2; // Add small gap to prevent penetration
-    
-    // Ensure ship is positioned well inside the station to avoid sensor boundary issues
-    const stationLength = 250;
-    const safeInteriorZ = Math.min(worldRelativePos.z, stationLength/2 - shipLength - 10); // 10 units from back wall
-    
-    const finalShipY = Math.max(minShipY, worldRelativePos.y);
-    
-    stationShipBody.setTranslation({ x: worldRelativePos.x, y: finalShipY, z: safeInteriorZ }, true);
-    stationShipBody.setRotation(currentShipRot, true);
-    
-    // Transform velocity to station-relative coordinates
-    const shipVel = new THREE.Vector3(currentShipVel.x, currentShipVel.y, currentShipVel.z);
-    shipVel.applyQuaternion(stationQuatInverse);
-    stationShipBody.setLinvel({ x: shipVel.x, y: shipVel.y, z: shipVel.z }, true);
-    
-    isShipDocked = true;
-    
-    console.log('Ship docked smoothly - exterior kinematic, station dynamic');
-    console.log('Station ship body position:', stationShipBody.translation());
-    console.log('Ship positioned naturally within station bounds');
-    
-    // Ship positioning debug info
-    const shipPos = stationShipBody.translation();
-    console.log('Ship positioned in station at:', { x: shipPos.x.toFixed(2), y: shipPos.y.toFixed(2), z: shipPos.z.toFixed(2) });
+    // Transform ship rotation to station-relative coordinates
+    const shipQuat = new THREE.Quaternion(currentShipRot.x, currentShipRot.y, currentShipRot.z, currentShipRot.w);
+    const stationRelativeRotation = shipQuat.multiply(stationQuatInverse);
+    stationShipBody.setRotation({
+      x: stationRelativeRotation.x,
+      y: stationRelativeRotation.y, 
+      z: stationRelativeRotation.z,
+      w: stationRelativeRotation.w
+    }, true);
     
     // Show ship proxy in station interior
     if (stationShipProxy) {
       stationShipProxy.visible = true;
-      console.log('Station ship proxy made visible');
     }
     
-    // If player is inside ship, they need to know the ship is now docked
-    if (isInsideShip) {
-      console.log('Player in ship during docking - ship now controlled by station physics');  
-    }
-    
-    // No transition data to clean up - immediate docking complete
+    console.log('Station ship taking control at:', stationShipBody.translation());
   }
 
   function dockShip() {
@@ -1764,17 +1703,17 @@
   function undockShip() {
     if (!isShipDocked) return;
     
-    console.log('Undocking ship - converting back to dynamic');
+    console.log('Seamlessly undocking ship - switching to exterior physics control');
+    isShipDocked = false;
     
-    // Get current ship state from both exterior and station worlds
+    // Get current ship state from station world
     const currentShipPos = shipBody.translation();
     const currentShipRot = shipBody.rotation();
-    const stationShipVel = stationShipBody.translation() ? stationShipBody.linvel() : { x: 0, y: 0, z: 0 };
-    const stationShipAngVel = stationShipBody.translation() ? stationShipBody.angvel() : { x: 0, y: 0, z: 0 };
+    const stationShipVel = stationShipBody.linvel();
+    const stationShipAngVel = stationShipBody.angvel();
     
-    console.log('Undocking ship with velocity:', stationShipVel);
-    
-    // Remove kinematic body and its colliders
+    // Convert kinematic ship back to dynamic body (exact ship exit pattern)
+    console.log('Removing kinematic body...');
     const numColliders = shipBody.numColliders();
     for (let i = numColliders - 1; i >= 0; i--) {
       const collider = shipBody.collider(i);
@@ -1782,10 +1721,9 @@
         exteriorWorld.removeCollider(collider, true);
       }
     }
-    
     exteriorWorld.removeRigidBody(shipBody);
     
-    // Create new dynamic ship body
+    console.log('Creating new dynamic body at:', { x: currentShipPos.x, y: currentShipPos.y, z: currentShipPos.z });
     const dynamicShipBodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(currentShipPos.x, currentShipPos.y, currentShipPos.z)
       .setRotation(currentShipRot)
@@ -1794,11 +1732,12 @@
       .setAngularDamping(2.0);
     shipBody = exteriorWorld.createRigidBody(dynamicShipBodyDesc);
     
-    // Apply momentum from station world to maintain smooth transition
+    console.log('New dynamic body created with handle:', shipBody.handle);
+    console.log('Body type is now:', shipBody.bodyType());
+    
+    // Maintain velocity from station simulation
     shipBody.setLinvel({ x: stationShipVel.x, y: stationShipVel.y, z: stationShipVel.z }, true);
     shipBody.setAngvel({ x: stationShipAngVel.x, y: stationShipAngVel.y, z: stationShipAngVel.z }, true);
-    
-    console.log('Applied momentum to undocked ship:', stationShipVel);
     
     // Recreate full ship colliders (not sensors) - same as original ship creation
     const shipWidth = 20, shipHeight = 6, shipLength = 30, wallThickness = 0.4;
@@ -1847,10 +1786,29 @@
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     exteriorWorld.createCollider(exteriorDoorSensorCollider, shipBody);
     
-    isShipDocked = false;
+    console.log('Exterior ship taking control at:', shipBody.translation());
+    console.log('Ship body type:', shipBody.bodyType());
+    console.log('Ship body handle:', shipBody.handle);
     
-    // Deactivate ship physics in station world by moving it out of the way
-    stationShipBody.setTranslation({ x: 0, y: -300, z: 0 }, true);
+    // Verify body is properly added to world
+    console.log('Exterior world bodies count:', exteriorWorld.bodies.len());
+    console.log('Exterior world colliders count:', exteriorWorld.colliders.len());
+    
+    // Verify colliders were created
+    console.log('Ship body colliders count:', shipBody.numColliders());
+    for (let i = 0; i < shipBody.numColliders(); i++) {
+      const collider = shipBody.collider(i);
+      if (collider) {
+        console.log(`  Collider ${i}: sensor=${collider.isSensor()}`);
+      }
+    }
+    
+    // Force a small forward impulse to ensure physics activation
+    shipBody.applyImpulse({ x: 0, y: 0, z: 1 }, true);
+    
+    // Deactivate station ship physics - move far away and make it kinematic to stop physics
+    stationShipBody.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased);
+    stationShipBody.setTranslation({ x: 0, y: -1000, z: 0 }, true);
     stationShipBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
     stationShipBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
     
@@ -1860,11 +1818,14 @@
       console.log('Station ship proxy hidden');
     }
     
+    // Test that ship body is responsive
+    setTimeout(() => {
+      console.log('Ship position after 100ms:', shipBody.translation());
+      console.log('Ship velocity:', shipBody.linvel());
+    }, 100);
+    
     // Set undock cooldown to prevent immediate re-docking
     lastUndockTime = Date.now();
-    
-    console.log('Ship undocked successfully - body type:', shipBody.bodyType());
-    console.log('Ship returned to exterior world physics with momentum preserved');
     console.log('Undock cooldown set - ship cannot re-dock for 2 seconds');
   }
 
@@ -2156,17 +2117,17 @@
     const stationRot = stationBody.rotation();
     const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
     
-    // Apply station rotation to interior relative position
+    // Transform player's actual station interior position to world coordinates
     const relativePos = new THREE.Vector3(currentStationPos.x, currentStationPos.y, currentStationPos.z);
     relativePos.applyQuaternion(stationQuat);
     
-    // Exit player at a safe position outside the station  
-    const safeExitOffset = new THREE.Vector3(-15, 1, 0); // Left side of station, just above ground
-    safeExitOffset.applyQuaternion(stationQuat);
+    // Exit player at their actual world position (where they were when they triggered the exit)
+    const exteriorX = stationPos.x + relativePos.x;
+    const exteriorY = Math.max(stationPos.y + relativePos.y, 2); // Ensure above ground (ground at -0.5)
+    const exteriorZ = stationPos.z + relativePos.z;
     
-    const exteriorX = stationPos.x + safeExitOffset.x;
-    const exteriorY = Math.max(stationPos.y + safeExitOffset.y, 2); // Ensure above ground (ground at -0.5)
-    const exteriorZ = stationPos.z + safeExitOffset.z;
+    console.log('Player exiting station from interior pos:', { x: currentStationPos.x.toFixed(2), y: currentStationPos.y.toFixed(2), z: currentStationPos.z.toFixed(2) });
+    console.log('Transformed to world pos:', { x: exteriorX.toFixed(2), y: exteriorY.toFixed(2), z: exteriorZ.toFixed(2) });
     
     console.log('Switching control - exterior position:', { exteriorX, exteriorY, exteriorZ });
     
@@ -2230,10 +2191,29 @@
       console.log('Player is grounded:', isGrounded);
     }, 100);
     
-    // If ship is still docked when player exits station, undock it
+    // Only undock ship if it's outside the docking bay area
     if (isShipDocked) {
-      console.log('Player exiting station - undocking ship as well');
-      undockShip();
+      const shipPos = shipBody.translation();
+      const stationPos = stationBody.translation();
+      const shipRelativeToStation = {
+        x: shipPos.x - stationPos.x,
+        y: shipPos.y - stationPos.y,
+        z: shipPos.z - stationPos.z
+      };
+      
+      const dockingBayWidth = 60, dockingBayHeight = 30;
+      const stationLength = 250;
+      // Check if ship is still in docking bay area
+      const isShipInDockingBay = Math.abs(shipRelativeToStation.x) < dockingBayWidth/2 && 
+                                shipRelativeToStation.y > 0 && shipRelativeToStation.y < dockingBayHeight &&
+                                shipRelativeToStation.z > stationLength/2 - 40 && shipRelativeToStation.z < stationLength/2;
+      
+      if (!isShipInDockingBay) {
+        console.log('Player exiting station - ship outside docking bay, undocking ship');
+        undockShip();
+      } else {
+        console.log('Player exiting station - ship still in docking bay, keeping docked');
+      }
     }
     
     // Reset exiting flag
@@ -2842,14 +2822,27 @@
       stationShipProxy.position.set(stationShipPos.x, stationShipPos.y, stationShipPos.z);
       stationShipProxy.quaternion.set(stationShipRot.x, stationShipRot.y, stationShipRot.z, stationShipRot.w);
       
-      // Debug logging for alignment issues
-      if (Math.random() < 0.01) { // 1% chance to avoid spam
-        console.log('Station ship alignment check:');
+      // Debug logging for alignment issues - more frequent to catch mismatch
+      if (frameCount % 180 === 0) { // Every 3 seconds
+        console.log('🔧 Station ship alignment check:');
         console.log('  Physics body pos:', { x: stationShipPos.x.toFixed(2), y: stationShipPos.y.toFixed(2), z: stationShipPos.z.toFixed(2) });
+        console.log('  Physics body rot:', { x: stationShipRot.x.toFixed(3), y: stationShipRot.y.toFixed(3), z: stationShipRot.z.toFixed(3), w: stationShipRot.w.toFixed(3) });
         console.log('  Visual proxy pos:', { x: stationShipProxy.position.x.toFixed(2), y: stationShipProxy.position.y.toFixed(2), z: stationShipProxy.position.z.toFixed(2) });
+        console.log('  Visual proxy rot:', { x: stationShipProxy.quaternion.x.toFixed(3), y: stationShipProxy.quaternion.y.toFixed(3), z: stationShipProxy.quaternion.z.toFixed(3), w: stationShipProxy.quaternion.w.toFixed(3) });
         console.log('  Proxy visible:', stationShipProxy.visible);
-        console.log('  Ship floor should be at Y:', (stationShipPos.y - 0.4).toFixed(2), '(station floor at Y=1)');
+        console.log('  Position match?', Math.abs(stationShipPos.x - stationShipProxy.position.x) < 0.1 && 
+                                         Math.abs(stationShipPos.y - stationShipProxy.position.y) < 0.1 && 
+                                         Math.abs(stationShipPos.z - stationShipProxy.position.z) < 0.1);
+        console.log('  Ship floor physics at Y:', (stationShipPos.y - 0.4).toFixed(2), '(station floor at Y=1)');
         console.log('  Ship bounds: X±10, Y:', (stationShipPos.y - 1).toFixed(2), 'to', (stationShipPos.y + 6).toFixed(2), ', Z±15');
+        
+        // Check if ship is positioned correctly relative to station floor
+        if (stationShipPos.y < 1.0) {
+          console.log('  ⚠️  WARNING: Ship physics body is below station floor! Should be at Y≥1.4');
+        }
+        if (Math.abs(stationShipPos.y - stationShipProxy.position.y) > 0.1) {
+          console.log('  ⚠️  WARNING: Physics body and visual proxy Y positions do not match!');
+        }
       }
       
       if (!stationShipProxy.visible) {
@@ -2922,32 +2915,6 @@
                 }
               }
               
-              // Check ship docking (ship to station docking sensor) 
-              if (!isShipDocked && (collider1.parent() === shipBody || collider2.parent() === shipBody)) {
-                const otherCollider = collider1.parent() === shipBody ? collider2 : collider1;
-                
-                // Debug: Log all ship collisions with station
-                if (otherCollider && otherCollider.parent() === stationBody) {
-                  const shipPos = shipBody.translation();
-                  const stationPos = stationBody.translation();
-                  console.log('Ship colliding with station component at ship pos:', shipPos, 'station pos:', stationPos);
-                  console.log('Is sensor?', otherCollider.isSensor());
-                }
-                
-                // Check if ship colliding with docking sensor (with cooldown to prevent immediate re-docking)
-                if (otherCollider && otherCollider.isSensor() && otherCollider.parent() === stationBody) {
-                  const currentTime = Date.now();
-                  const timeSinceUndock = currentTime - lastUndockTime;
-                  
-                  if (timeSinceUndock > 2000) { // 2 second cooldown after undocking
-                    const shipPos = shipBody.translation();
-                    console.log('SHIP DOCKING DETECTED - Deferring docking until after physics step:', shipPos);
-                    pendingShipDocking = true;
-                  } else {
-                    console.log('SHIP DOCKING BLOCKED - Cooldown active, time since undock:', timeSinceUndock);
-                  }
-                }
-              }
             } catch (error) {
               console.warn('Error processing exterior collision events:', error);
             }
@@ -3044,67 +3011,149 @@
           startShipDockingTransition();
         }
         
-        // Position-based ship entry detection (runs every frame) - only when ship is docked in station
-        if (isInsideStation && isShipDocked && !isInsideShip && !isExiting && !isTransitioning && !isEntering && !pendingShipEntryFromStation) {
-          const playerPos = stationPlayerBody.translation();
-          const shipPos = stationShipBody.translation();
+        // Position-based ship docking check (runs every frame)
+        if (!isShipDocked && !pendingShipDocking) {
+          const currentTime = Date.now();
+          const timeSinceUndock = currentTime - lastUndockTime;
           
-          // Check if player is within ship interior bounds (station world coordinates)
-          const relativeToShip = {
-            x: playerPos.x - shipPos.x,
-            y: playerPos.y - shipPos.y,
-            z: playerPos.z - shipPos.z
+          // Check if ship is inside docking bay bounds with cooldown
+          if (timeSinceUndock > 2000) { // 2 second cooldown after undocking
+            const shipPos = shipBody.translation();
+            const stationPos = stationBody.translation();
+            const shipRelativeToStation = {
+              x: shipPos.x - stationPos.x,
+              y: shipPos.y - stationPos.y,
+              z: shipPos.z - stationPos.z
+            };
+            
+            const dockingBayWidth = 60, dockingBayHeight = 30;
+            const stationLength = 250;
+            // Check if ship is in docking bay area (front part of station)
+            const isShipInDockingBay = Math.abs(shipRelativeToStation.x) < dockingBayWidth/2 && 
+                                      shipRelativeToStation.y > 0 && shipRelativeToStation.y < dockingBayHeight &&
+                                      shipRelativeToStation.z > stationLength/2 - 40 && shipRelativeToStation.z < stationLength/2;
+            
+            if (isShipInDockingBay) {
+              console.log('SHIP DOCKING DETECTED (position-based) - Deferring docking until after physics step');
+              pendingShipDocking = true;
+            }
+          }
+        }
+
+        // Position-based ship entry detection (runs every frame) - check if ship is physically in station bounds
+        if (isInsideStation && !isInsideShip && !isExiting && !isTransitioning && !isEntering && !pendingShipEntryFromStation) {
+          const playerPos = stationPlayerBody.translation();
+          
+          // Check if ship is physically inside station bounds (regardless of docking status)
+          const shipPos = shipBody.translation(); // Use exterior ship position
+          const stationPos = stationBody.translation();
+          const shipRelativeToStation = {
+            x: shipPos.x - stationPos.x,
+            y: shipPos.y - stationPos.y,
+            z: shipPos.z - stationPos.z
           };
           
+          // Station interior bounds: ±99 X, 1-59 Y, ±124 Z (from original design)
+          const stationWidth = 200, stationHeight = 60, stationLength = 250;
+          const isShipPhysicallyInStation = Math.abs(shipRelativeToStation.x) < stationWidth/2 && 
+                                            shipRelativeToStation.y > -5 && shipRelativeToStation.y < stationHeight &&
+                                            Math.abs(shipRelativeToStation.z) < stationLength/2;
+          
+          if (!isShipPhysicallyInStation) {
+            // Skip ship entry detection if ship is not in station
+            if (frameCount % 120 === 0) { // Every 2 seconds
+              console.log('🔍 Ship not in station bounds, skipping ship entry detection');
+              console.log('  Ship pos:', {x: shipPos.x.toFixed(2), y: shipPos.y.toFixed(2), z: shipPos.z.toFixed(2)});
+              console.log('  Station pos:', {x: stationPos.x.toFixed(2), y: stationPos.y.toFixed(2), z: stationPos.z.toFixed(2)});
+              console.log('  Ship relative to station:', {x: shipRelativeToStation.x.toFixed(2), y: shipRelativeToStation.y.toFixed(2), z: shipRelativeToStation.z.toFixed(2)});
+            }
+          } else {
+            // Ship is physically inside station - calculate ship interior bounds relative to player
+            // Transform exterior ship position to station interior coordinates
+            const stationRot = stationBody.rotation();
+            const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
+            const stationQuatInverse = stationQuat.clone().invert();
+            
+            // Convert ship world position to station-relative position
+            const shipWorldRelative = new THREE.Vector3(
+              shipRelativeToStation.x, shipRelativeToStation.y, shipRelativeToStation.z
+            );
+            shipWorldRelative.applyQuaternion(stationQuatInverse);
+            
+            // Check if player is within ship interior bounds (station interior coordinates)
+            const relativeToShip = {
+              x: playerPos.x - shipWorldRelative.x,
+              y: playerPos.y - shipWorldRelative.y,
+              z: playerPos.z - shipWorldRelative.z
+            };
+          
           // Ship interior bounds: width=20, height=6, length=30
-          const shipWidth = 20, shipHeight = 6, shipLength = 30;
+          // Floor is at Y=-0.4, ceiling at Y=5.6 (shipHeight-wallThickness), walls span this range
+          const shipWidth = 20, shipHeight = 6, shipLength = 30, wallThickness = 0.4;
           const xInBounds = Math.abs(relativeToShip.x) < shipWidth/2;
-          const yInBounds = relativeToShip.y > -1 && relativeToShip.y < shipHeight;
+          const yInBounds = relativeToShip.y > (-wallThickness - 0.1) && relativeToShip.y < (shipHeight - wallThickness + 0.1); // Floor at -0.4, ceiling at 5.6
           const zInBounds = Math.abs(relativeToShip.z) < shipLength/2;
           const isPlayerInsideShipBounds = xInBounds && yInBounds && zInBounds;
           
-          // Debug logging every few frames to see what's happening
-          if (frameCount % 60 === 0) { // Every 1 second at 60fps
-            console.log('🔍 Position-based ship entry check:');
-            console.log('  Player pos in station:', {x: playerPos.x.toFixed(2), y: playerPos.y.toFixed(2), z: playerPos.z.toFixed(2)});
-            console.log('  Ship pos in station:', {x: shipPos.x.toFixed(2), y: shipPos.y.toFixed(2), z: shipPos.z.toFixed(2)});
-            console.log('  Player relative to ship:', {x: relativeToShip.x.toFixed(2), y: relativeToShip.y.toFixed(2), z: relativeToShip.z.toFixed(2)});
-            console.log('  Bounds check (width=20, height=6, length=30):', {
-              xOK: xInBounds, xValue: Math.abs(relativeToShip.x).toFixed(2), xLimit: (shipWidth/2).toFixed(2),
-              yOK: yInBounds, yValue: relativeToShip.y.toFixed(2), yRange: '-1 to 6',
-              zOK: zInBounds, zValue: Math.abs(relativeToShip.z).toFixed(2), zLimit: (shipLength/2).toFixed(2)
-            });
-            console.log('  Overall inside bounds:', isPlayerInsideShipBounds);
-            console.log('  Conditions check:', { 
-              isInsideStation, 
-              isShipDocked, 
-              isInsideShip, 
-              isExiting, 
-              isTransitioning, 
-              isEntering, 
-              pendingShipEntryFromStation 
-            });
+            // Debug logging every few frames to see what's happening
+            if (frameCount % 60 === 0) { // Every 1 second at 60fps
+              console.log('🔍 Position-based ship entry check (ship in station):');
+              console.log('  Player pos in station:', {x: playerPos.x.toFixed(2), y: playerPos.y.toFixed(2), z: playerPos.z.toFixed(2)});
+              console.log('  Ship pos in station coords:', {x: shipWorldRelative.x.toFixed(2), y: shipWorldRelative.y.toFixed(2), z: shipWorldRelative.z.toFixed(2)});
+              console.log('  Player relative to ship:', {x: relativeToShip.x.toFixed(2), y: relativeToShip.y.toFixed(2), z: relativeToShip.z.toFixed(2)});
+              console.log('  Bounds check (width=20, height=6, length=30):', {
+                xOK: xInBounds, xValue: Math.abs(relativeToShip.x).toFixed(2), xLimit: (shipWidth/2).toFixed(2),
+                yOK: yInBounds, yValue: relativeToShip.y.toFixed(2), yRange: (-wallThickness - 0.1).toFixed(1) + ' to ' + (shipHeight - wallThickness + 0.1).toFixed(1),
+                zOK: zInBounds, zValue: Math.abs(relativeToShip.z).toFixed(2), zLimit: (shipLength/2).toFixed(2)
+              });
+              console.log('  Overall inside bounds:', isPlayerInsideShipBounds);
+              console.log('  Ship docked status:', isShipDocked, '(not required for entry)');
+            }
             
-            // Check if the main condition is blocking
-            const mainCondition = isInsideStation && isShipDocked && !isInsideShip && !isExiting && !isTransitioning && !isEntering && !pendingShipEntryFromStation;
-            console.log('  Main condition satisfied:', mainCondition);
-            if (!mainCondition) {
-              console.log('  → Blocked by:', 
-                !isInsideStation ? 'not in station' :
-                !isShipDocked ? 'ship not docked' :
-                isInsideShip ? 'already in ship' :
-                isExiting ? 'currently exiting' :
-                isTransitioning ? 'currently transitioning' :
-                isEntering ? 'currently entering' :
-                pendingShipEntryFromStation ? 'entry already pending' :
-                'unknown reason');
+            if (isPlayerInsideShipBounds) {
+              console.log('🎯 SHIP ENTRY FROM STATION DETECTED (position-based):');
+              console.log('  Ship physically in station, player in ship bounds');
+              console.log('  Triggering ship entry transition...');
+              pendingShipEntryFromStation = true;
             }
           }
+        }
+        
+        // Position-based station exit detection (similar to ship exit logic)
+        if (isInsideStation && !isInsideShip && !isExiting && !isTransitioning && !isEntering) {
+          const stationPlayerPos = stationPlayerBody.translation();
+          const stationPos = stationBody.translation();
           
-          if (isPlayerInsideShipBounds) {
-            console.log('🎯 SHIP ENTRY FROM STATION DETECTED (position-based):');
-            console.log('  Triggering ship entry transition...');
-            pendingShipEntryFromStation = true;
+          // Check if player is outside station bounds (station interior bounds: ±99 X, 1-59 Y, ±124 Z)
+          const relativeToStation = {
+            x: stationPlayerPos.x,  // Station interior is at origin, so position is relative
+            y: stationPlayerPos.y,
+            z: stationPlayerPos.z
+          };
+          
+          // Station interior bounds (larger than ship)
+          const stationWidth = 200, stationHeight = 60, stationLength = 250;  // Full interior dimensions
+          const isPlayerOutsideStationBounds = Math.abs(relativeToStation.x) > stationWidth/2 || 
+                                               relativeToStation.y < -5 || relativeToStation.y > stationHeight ||
+                                               Math.abs(relativeToStation.z) > stationLength/2;
+          
+          // Debug logging for station exit (less frequent)
+          if (frameCount % 120 === 0) { // Every 2 seconds
+            console.log('🚪 Position-based station exit check:');
+            console.log('  Player pos in station:', {x: relativeToStation.x.toFixed(2), y: relativeToStation.y.toFixed(2), z: relativeToStation.z.toFixed(2)});
+            console.log('  Station bounds (W×H×L):', stationWidth, '×', stationHeight, '×', stationLength);
+            console.log('  Outside bounds?', {
+              xOut: Math.abs(relativeToStation.x) > stationWidth/2,
+              yOut: relativeToStation.y < -5 || relativeToStation.y > stationHeight,
+              zOut: Math.abs(relativeToStation.z) > stationLength/2,
+              overall: isPlayerOutsideStationBounds
+            });
+          }
+          
+          if (isPlayerOutsideStationBounds) {
+            console.log('🎯 STATION EXIT DETECTED (position-based):');
+            console.log('  Player outside station bounds, switching to exterior world');
+            exitStation();
           }
         }
         
