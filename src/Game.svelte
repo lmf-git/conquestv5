@@ -528,8 +528,8 @@
       .setTranslation(0, SHIP_HEIGHT - (SHIP_HEIGHT - DOOR_HEIGHT) / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
     exteriorWorld.createCollider(frontWallTopCollider, body);
     
-    // Create ship entry sensor for player detection in exterior world - small and inside door threshold
-    const shipEntrySensorCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2 - 0.2, DOOR_HEIGHT / 2 - 0.2, 0.3)
+    // Create ship entry sensor for player detection in exterior world - reasonable sensor at door threshold
+    const shipEntrySensorCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2 - 0.5, DOOR_HEIGHT / 2 - 0.5, 0.3)
       .setTranslation(0, DOOR_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS - 0.5)
       .setSensor(true)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
@@ -1040,7 +1040,7 @@
     stationWorld.createCollider(shipFrontWallTopInStationCollider, stationShipBody);
     
     // Create ship entry sensor for station world - allows player to enter ship from station
-    const shipStationEntrySensorCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2 - 0.2, DOOR_HEIGHT / 2 - 0.2, 0.3)
+    const shipStationEntrySensorCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2 - 0.5, DOOR_HEIGHT / 2 - 0.5, 0.3)
       .setTranslation(0, DOOR_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS - 0.5)
       .setSensor(true)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
@@ -1646,12 +1646,12 @@
     // Use global constants
     const doorZ = SHIP_LENGTH / 2 - 0.4; // Front door position (14.6)
     
-    // More restrictive exit detection - player must be clearly exiting
-    const wellBeyondDoor = interiorPos.z > doorZ + 1; // Must be 1 unit past the door
-    const strongExitMomentum = interiorVel.z > 2.0; // Strong forward movement
-    const inDoorWidth = Math.abs(interiorPos.x) < 2; // Within door width
+    // Faster exit detection - player exits sooner when approaching door
+    const nearDoor = interiorPos.z > doorZ - 0.2; // Just slightly past door threshold
+    const exitMomentum = interiorVel.z > 0.5; // Light forward movement
+    const inDoorWidth = Math.abs(interiorPos.x) < 3; // Wider door width tolerance
     
-    if (wellBeyondDoor && strongExitMomentum && inDoorWidth) {
+    if (nearDoor && exitMomentum && inDoorWidth) {
       console.log('INSTANT EXIT TRIGGERED - Player clearly exiting:', { interiorPos, interiorVel, doorZ });
       
       // Lock exit to prevent multiple calls
