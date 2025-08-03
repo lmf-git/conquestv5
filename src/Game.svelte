@@ -1310,8 +1310,8 @@
   }
   
   function handleClick() {
-    if (!isPointerLocked && isFirstPerson) {
-      // Request pointer lock when clicking in first person mode
+    if (!isPointerLocked && isInExterior) {
+      // Request pointer lock when clicking in exterior world (both FPS and third person)
       canvas.requestPointerLock();
     }
   }
@@ -1328,13 +1328,13 @@
   }
 
   function handleMouseMove(event) {
-    if (!isPointerLocked || !isFirstPerson) return;
+    if (!isPointerLocked || !isInExterior) return;
     
     const sensitivity = 0.002;
     const deltaX = event.movementX * sensitivity;
     const deltaY = event.movementY * sensitivity;
     
-    // Update camera rotation
+    // Update camera rotation for both modes
     cameraRotation.yaw += deltaX;
     cameraRotation.pitch -= deltaY;
     
@@ -1344,6 +1344,9 @@
     // Keep yaw in reasonable bounds (optional, helps prevent numerical drift)
     while (cameraRotation.yaw > Math.PI) cameraRotation.yaw -= 2 * Math.PI;
     while (cameraRotation.yaw < -Math.PI) cameraRotation.yaw += 2 * Math.PI;
+    
+    // Player capsule rotation is handled visually through the mesh, not physics body
+    // The physics body stays upright for stability while aiming direction is visual
   }
 
   function handleKeyUp(event) {
@@ -1646,12 +1649,12 @@
     // Use global constants
     const doorZ = SHIP_LENGTH / 2 - 0.4; // Front door position (14.6)
     
-    // Faster exit detection - player exits sooner when approaching door
-    const nearDoor = interiorPos.z > doorZ - 0.2; // Just slightly past door threshold
+    // Exit detection aligned with ship visual boundaries 
+    const beyondShipBounds = interiorPos.z > doorZ + 0.5; // Exit when clearly outside ship
     const exitMomentum = interiorVel.z > 0.5; // Light forward movement
     const inDoorWidth = Math.abs(interiorPos.x) < 3; // Wider door width tolerance
     
-    if (nearDoor && exitMomentum && inDoorWidth) {
+    if (beyondShipBounds && exitMomentum && inDoorWidth) {
       console.log('INSTANT EXIT TRIGGERED - Player clearly exiting:', { interiorPos, interiorVel, doorZ });
       
       // Lock exit to prevent multiple calls
@@ -2705,6 +2708,16 @@
       moveZ /= length;
     }
     
+    // Transform movement direction based on camera rotation when in exterior world with pointer lock
+    if (isInExterior && isPointerLocked) {
+      const cos = Math.cos(cameraRotation.yaw);
+      const sin = Math.sin(cameraRotation.yaw);
+      const rotatedX = moveX * cos - moveZ * sin;
+      const rotatedZ = moveX * sin + moveZ * cos;
+      moveX = rotatedX;
+      moveZ = rotatedZ;
+    }
+    
     // Use different speed based on grounded state
     const currentSpeed = isGrounded ? groundSpeed : airSpeed;
     const impulse = { x: moveX * currentSpeed * deltaTime * 30, y: 0, z: moveZ * currentSpeed * deltaTime * 30 };
@@ -2893,6 +2906,11 @@
       // Position player mesh for exterior view
       playerMesh.position.set(pos.x, pos.y, pos.z);
       
+      // Apply aiming rotation to player mesh for both first and third person modes
+      if (isPointerLocked) {
+        playerMesh.rotation.y = cameraRotation.yaw;
+      }
+      
       // Hide debug player mesh when outside
       debugPlayerMesh.visible = false;
       
@@ -2923,9 +2941,9 @@
   
   
   function updateShip(deltaTime) {
-    const thrustPower = 2000; // Much stronger thrust power
-    const liftPower = 2500; // Much stronger lift power  
-    const torquePower = 1000; // Much stronger torque power
+    const thrustPower = 500; // Reduced thrust power for better control
+    const liftPower = 600; // Reduced lift power for better control
+    const torquePower = 300; // Reduced torque power for better control
     
     try {
     
@@ -2984,19 +3002,15 @@
         }
         
         if (thrustZ !== 0) {
+          const dockedShipThrustPower = 500; // Match exterior ship thrust power
           const forwardVector = new THREE.Vector3(0, 0, thrustZ).applyQuaternion(stationShipQuat);
           const thrustForce = {
-            x: forwardVector.x * thrustPower,
-            y: forwardVector.y * thrustPower,
-            z: forwardVector.z * thrustPower
+            x: forwardVector.x * dockedShipThrustPower,
+            y: forwardVector.y * dockedShipThrustPower,
+            z: forwardVector.z * dockedShipThrustPower
           };
-          const thrustImpulse = {
-            x: forwardVector.x * thrustPower * deltaTime,
-            y: forwardVector.y * thrustPower * deltaTime,
-            z: forwardVector.z * thrustPower * deltaTime
-          };
+          // Use only force for smoother, more controllable movement
           stationShipBody.addForce(thrustForce, true);
-          stationShipBody.applyImpulse(thrustImpulse, true);
         }
         
         // Vertical movement
@@ -3009,9 +3023,9 @@
         }
         
         if (verticalThrust !== 0) {
-          const verticalPower = 800; // Moderate power for docked ship
-          const liftForce = { x: 0, y: verticalThrust * verticalPower, z: 0 };
-          const liftImpulse = { x: 0, y: verticalThrust * verticalPower * deltaTime, z: 0 };
+          const dockedShipLiftPower = 600; // Match exterior ship lift power
+          const liftForce = { x: 0, y: verticalThrust * dockedShipLiftPower, z: 0 };
+          const liftImpulse = { x: 0, y: verticalThrust * dockedShipLiftPower * deltaTime, z: 0 };
           stationShipBody.addForce(liftForce, true);
           stationShipBody.applyImpulse(liftImpulse, true);
         }
@@ -3026,8 +3040,9 @@
         }
         
         if (yawTorque !== 0) {
-          const torqueForce = { x: 0, y: yawTorque * torquePower, z: 0 };
-          const torqueImpulse = { x: 0, y: yawTorque * torquePower * deltaTime, z: 0 };
+          const dockedShipTorquePower = 300; // Match exterior ship torque power
+          const torqueForce = { x: 0, y: yawTorque * dockedShipTorquePower, z: 0 };
+          const torqueImpulse = { x: 0, y: yawTorque * dockedShipTorquePower * deltaTime, z: 0 };
           stationShipBody.addTorque(torqueForce, true);
           stationShipBody.applyTorqueImpulse(torqueImpulse, true);
         }
@@ -3074,24 +3089,15 @@
     if (thrustZ !== 0) {
       const forwardVector = new THREE.Vector3(0, 0, thrustZ).applyQuaternion(shipQuat);
       
-      // Try both force AND impulse for stronger effect
+      // Use only force for smoother, more controllable movement
       const thrustForce = {
         x: forwardVector.x * thrustPower,
         y: forwardVector.y * thrustPower,
         z: forwardVector.z * thrustPower
       };
-      const thrustImpulse = {
-        x: forwardVector.x * thrustPower * deltaTime,
-        y: forwardVector.y * thrustPower * deltaTime,
-        z: forwardVector.z * thrustPower * deltaTime
-      };
       
-      // Thrust applied (removed verbose force/impulse log)
-      // Ship thrust applied
-      
-      // Apply both force and impulse for maximum effect
+      // Apply only force for better control
       shipBody.addForce(thrustForce, true);
-      shipBody.applyImpulse(thrustImpulse, true);
       
       // Ship velocity updated
     }
@@ -3108,16 +3114,12 @@
     }
     
     if (verticalThrust !== 0) {
-      // Use much more moderate vertical forces
-      const verticalPower = isInsideShip ? 800 : liftPower; // Gentler when piloted from inside
+      // Use more moderate vertical forces
+      const verticalPower = isInsideShip ? 400 : liftPower; // Gentler when piloted from inside
       const liftForce = { x: 0, y: verticalThrust * verticalPower, z: 0 };
-      const liftImpulse = { x: 0, y: verticalThrust * verticalPower * deltaTime, z: 0 };
       
-      // console.log('Applying vertical thrust - Force:', liftForce, 'Impulse:', liftImpulse);
-      
-      // Apply both force and impulse
+      // Use only force for smoother control
       shipBody.addForce(liftForce, true);
-      shipBody.applyImpulse(liftImpulse, true);
     }
     
     // Yaw rotation (left/right arrows)
