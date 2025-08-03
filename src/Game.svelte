@@ -344,6 +344,8 @@
     const capsuleHeight = 1.5;
     
     const capsuleGeometry = new THREE.CapsuleGeometry(capsuleRadius, capsuleHeight, 4, 8);
+    // Translate geometry so capsule rotates around its base (feet) instead of center
+    capsuleGeometry.translate(0, capsuleHeight / 2, 0);
     const capsuleMaterial = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
     playerMesh = new THREE.Mesh(capsuleGeometry, capsuleMaterial);
     playerMesh.castShadow = true;
@@ -666,6 +668,8 @@
     const capsuleRadius = 0.5;
     const capsuleHeight = 1.5;
     const debugCapsuleGeometry = new THREE.CapsuleGeometry(capsuleRadius, capsuleHeight, 4, 8);
+    // Translate geometry so capsule rotates around its base (feet) instead of center
+    debugCapsuleGeometry.translate(0, capsuleHeight / 2, 0);
     const debugCapsuleMaterial = new THREE.MeshStandardMaterial({ 
       color: 0x00ff00, 
       wireframe: true,
@@ -899,6 +903,8 @@
     const capsuleRadius = 0.5;
     const capsuleHeight = 1.5;
     const debugCapsuleGeometry = new THREE.CapsuleGeometry(capsuleRadius, capsuleHeight, 4, 8);
+    // Translate geometry so capsule rotates around its base (feet) instead of center
+    debugCapsuleGeometry.translate(0, capsuleHeight / 2, 0);
     const debugCapsuleMaterial = new THREE.MeshStandardMaterial({ 
       color: 0xff0000, 
       wireframe: true,
@@ -1310,8 +1316,8 @@
   }
   
   function handleClick() {
-    if (!isPointerLocked && isInExterior) {
-      // Request pointer lock when clicking in exterior world (both FPS and third person)
+    if (!isPointerLocked) {
+      // Request pointer lock when clicking in any world (exterior, ship, or station)
       canvas.requestPointerLock();
     }
   }
@@ -1328,14 +1334,14 @@
   }
 
   function handleMouseMove(event) {
-    if (!isPointerLocked || !isInExterior) return;
+    if (!isPointerLocked) return;
     
     const sensitivity = 0.002;
     const deltaX = event.movementX * sensitivity;
     const deltaY = event.movementY * sensitivity;
     
     // Update camera rotation for both modes
-    cameraRotation.yaw += deltaX;
+    cameraRotation.yaw -= deltaX; // Invert X for correct left/right aiming
     cameraRotation.pitch -= deltaY;
     
     // Clamp vertical rotation to prevent over-rotation
@@ -1470,9 +1476,7 @@
     // Update proxy context first
     enterShipFromExteriorContext(interiorPlayerBody);
     
-    // Reset camera to consistent angle when entering ship
-    cameraRotation.yaw = 0;
-    cameraRotation.pitch = 0;
+    // Preserve camera rotation when entering ship (removed reset for FPS continuity)
     
     // Get current exterior player state
     const currentExteriorPos = playerBody.translation();
@@ -1799,9 +1803,7 @@
     // Update proxy context for station entry
     enterStationWorld(stationPlayerBody);
     
-    // Reset camera to consistent angle when entering station
-    cameraRotation.yaw = 0;
-    cameraRotation.pitch = 0;
+    // Preserve camera rotation when entering station (removed reset for FPS continuity)
     
     // Additional safety check - ensure we have valid bodies
     if (!playerBody || !playerCollider || !stationPlayerBody) {
@@ -2167,6 +2169,11 @@
 
   function exitShip() {
     console.log('=== PLAYER EXITING SHIP ===');
+    
+    // Reset ship movement when player exits to prevent continued movement
+    shipMovement = { forward: false, backward: false, left: false, right: false, up: false, down: false };
+    console.log('Ship movement reset - ship should stop moving');
+    
     console.log('Current proxy context:', playerProxyContext);
     console.log('Ship docking status check: isShipDocked =', isShipDocked);
     console.log('Ship exterior body position:', shipBody.translation());
@@ -2434,9 +2441,7 @@
     console.log('🚀 ENTERING SHIP FROM STATION - NESTED STATIC PROXY TRANSITION');
     console.log('  Before proxy context:', playerProxyContext);
     
-    // Reset camera to consistent angle when entering ship from station
-    cameraRotation.yaw = 0;
-    cameraRotation.pitch = 0;
+    // Preserve camera rotation when entering ship from station (removed reset for FPS continuity)
     
     // Update proxy context for nested ship entry
     enterShipFromStationContext(interiorPlayerBody);
@@ -2708,10 +2713,12 @@
       moveZ /= length;
     }
     
-    // Transform movement direction based on camera rotation when in exterior world with pointer lock
-    if (isInExterior && isPointerLocked) {
-      const cos = Math.cos(cameraRotation.yaw);
-      const sin = Math.sin(cameraRotation.yaw);
+    // Transform movement direction based on camera rotation when pointer locked (all worlds)
+    if (isPointerLocked) {
+      // Use negative yaw to match the visual capsule rotation direction
+      const playerYaw = -cameraRotation.yaw;
+      const cos = Math.cos(playerYaw);
+      const sin = Math.sin(playerYaw);
       const rotatedX = moveX * cos - moveZ * sin;
       const rotatedZ = moveX * sin + moveZ * cos;
       moveX = rotatedX;
@@ -2743,12 +2750,19 @@
       // Only show debug player mesh if interior body is at a reasonable position (not at init position)
       if (pos.y > -50) { // Interior body was initialized at y: -100, so wait until properly positioned
         debugPlayerMesh.position.set(pos.x, pos.y, pos.z);
+        // Apply aiming rotation when pointer locked
+        if (isPointerLocked) {
+          debugPlayerMesh.rotation.y = -cameraRotation.yaw;
+        }
         debugPlayerMesh.visible = true;
       } else {
         debugPlayerMesh.visible = false;
       }
       
       let exteriorPos;
+      
+      // Get ship rotation for camera calculations (needed in both docked and free-flying cases)
+      const shipRot = (isShipDocked && stationShipBody) ? stationShipBody.rotation() : shipBody.rotation();
       
       if (isShipDocked && stationShipBody) {
         // Transform interior player position through station world to exterior world
@@ -2781,7 +2795,6 @@
       } else {
         // Direct transformation to exterior world coordinates
         const shipPos = shipBody.translation();
-        const shipRot = shipBody.rotation();
         const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
         
         const relativePos = new THREE.Vector3(pos.x, pos.y, pos.z);
@@ -2804,8 +2817,9 @@
       playerMesh.position.set(exteriorPos.x, exteriorPos.y, exteriorPos.z);
       playerMesh.quaternion.set(targetRotation.x, targetRotation.y, targetRotation.z, targetRotation.w);
       
-      // Interior camera has completely fixed position and angle - NEVER change it
-      // Camera position and angle are set once during initialization and remain constant
+      // Interior camera has fixed position for overview
+      interiorCamera.position.set(0, 4, 25);
+      interiorCamera.lookAt(0, 1.5, 0);
       
       // Exterior camera follows real world player representation when inside ship
       if (isFirstPerson) {
@@ -2837,6 +2851,10 @@
       // Show debug station player mesh if positioned correctly
       if (pos.y > -150) { // Station body was initialized at y: -200
         debugStationPlayerMesh.position.set(pos.x, pos.y, pos.z);
+        // Apply aiming rotation when pointer locked
+        if (isPointerLocked) {
+          debugStationPlayerMesh.rotation.y = -cameraRotation.yaw;
+        }
         debugStationPlayerMesh.visible = true;
       } else {
         debugStationPlayerMesh.visible = false;
@@ -2908,7 +2926,7 @@
       
       // Apply aiming rotation to player mesh for both first and third person modes
       if (isPointerLocked) {
-        playerMesh.rotation.y = cameraRotation.yaw;
+        playerMesh.rotation.y = -cameraRotation.yaw; // Negate for correct direction
       }
       
       // Hide debug player mesh when outside
@@ -2924,10 +2942,108 @@
         const mouseLookQuat = new THREE.Quaternion().setFromEuler(mouseLookEuler);
         exteriorCamera.quaternion.copy(mouseLookQuat);
       } else {
-        // Third person - camera much further behind and above player  
-        exteriorCamera.position.set(pos.x, pos.y + 15, pos.z + 30);
-        exteriorCamera.lookAt(pos.x, pos.y + 1, pos.z);
+        // Third person - camera behind and above player, following capsule rotation
+        if (isPointerLocked) {
+          // Position camera relative to player's rotation
+          const distance = 30;
+          const height = 15;
+          const playerYaw = -cameraRotation.yaw; // Match player mesh rotation
+          
+          const cameraX = pos.x + Math.sin(playerYaw) * distance;
+          const cameraZ = pos.z + Math.cos(playerYaw) * distance;
+          
+          exteriorCamera.position.set(cameraX, pos.y + height, cameraZ);
+          exteriorCamera.lookAt(pos.x, pos.y + 1, pos.z);
+        } else {
+          // Default third person position when not pointer locked
+          exteriorCamera.position.set(pos.x, pos.y + 15, pos.z + 30);
+          exteriorCamera.lookAt(pos.x, pos.y + 1, pos.z);
+        }
       }
+    }
+    
+    // Universal FPS camera positioning - overrides world-specific camera positioning when in FPS mode
+    if (isFirstPerson && isPointerLocked) {
+      // Get current active player position in exterior world coordinates
+      let worldPos;
+      
+      if (isInsideShip) {
+        // Player inside ship - use the exterior world position calculated for ship
+        const interiorPos = interiorPlayerBody.translation();
+        
+        if (isShipDocked && stationShipBody) {
+          // Ship is docked - transform through station coordinates
+          const stationShipPos = stationShipBody.translation();
+          const stationShipRot = stationShipBody.rotation();
+          const stationShipQuat = new THREE.Quaternion(stationShipRot.x, stationShipRot.y, stationShipRot.z, stationShipRot.w);
+          
+          const relativePos = new THREE.Vector3(interiorPos.x, interiorPos.y, interiorPos.z);
+          relativePos.applyQuaternion(stationShipQuat);
+          
+          const stationWorldPos = new THREE.Vector3(
+            stationShipPos.x + relativePos.x,
+            stationShipPos.y + relativePos.y,
+            stationShipPos.z + relativePos.z
+          );
+          
+          const stationPos = stationBody.translation();
+          const stationRot = stationBody.rotation();
+          const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
+          
+          stationWorldPos.applyQuaternion(stationQuat);
+          
+          worldPos = {
+            x: stationPos.x + stationWorldPos.x,
+            y: stationPos.y + stationWorldPos.y,
+            z: stationPos.z + stationWorldPos.z
+          };
+        } else {
+          // Ship is free-flying - direct transformation
+          const shipPos = shipBody.translation();
+          const shipRot = shipBody.rotation();
+          const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
+          
+          const relativePos = new THREE.Vector3(interiorPos.x, interiorPos.y, interiorPos.z);
+          relativePos.applyQuaternion(shipQuat);
+          
+          worldPos = {
+            x: shipPos.x + relativePos.x,
+            y: shipPos.y + relativePos.y,
+            z: shipPos.z + relativePos.z
+          };
+        }
+      } else if (isInsideStation) {
+        // Player inside station - transform station coordinates to world coordinates
+        const stationPlayerPos = stationPlayerBody.translation();
+        const stationPos = stationBody.translation();
+        const stationRot = stationBody.rotation();
+        const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
+        
+        const relativePos = new THREE.Vector3(stationPlayerPos.x, stationPlayerPos.y, stationPlayerPos.z);
+        relativePos.applyQuaternion(stationQuat);
+        
+        worldPos = {
+          x: stationPos.x + relativePos.x,
+          y: stationPos.y + relativePos.y,
+          z: stationPos.z + relativePos.z
+        };
+      } else {
+        // Player in exterior world - use position directly
+        const exteriorPos = playerBody.translation();
+        worldPos = {
+          x: exteriorPos.x,
+          y: exteriorPos.y,
+          z: exteriorPos.z
+        };
+      }
+      
+      // Position exterior camera at player's world position with FPS mouse look
+      exteriorCamera.position.set(worldPos.x, worldPos.y + 1.5, worldPos.z);
+      
+      // Apply mouse look rotation directly in world space
+      const mouseLookEuler = new THREE.Euler(cameraRotation.pitch, cameraRotation.yaw, 0, 'YXZ');
+      const mouseLookQuat = new THREE.Quaternion().setFromEuler(mouseLookEuler);
+      exteriorCamera.quaternion.copy(mouseLookQuat);
     }
     
     // Update debug states
@@ -3159,7 +3275,7 @@
     // Interior proxy always stays at origin (static)
     if (isInsideShip) {
       shipInteriorProxy.position.set(0, 0, 0);
-      // Interior camera angle is fixed - don't change it
+      // Interior camera positioning is now handled in updatePlayer() for FPS support
     }
     
     } catch (error) {
@@ -3691,10 +3807,18 @@
     const interiorPos = interiorPlayerBody.translation();
     if (interiorPos.y > -50) {
       debugPlayerMesh.position.set(interiorPos.x, interiorPos.y, interiorPos.z);
+      // Apply aiming rotation when pointer locked
+      if (isPointerLocked) {
+        debugPlayerMesh.rotation.y = -cameraRotation.yaw;
+      }
       debugPlayerMesh.visible = true;
     } else {
       debugPlayerMesh.visible = false;
     }
+    
+    // Interior camera stays fixed for overview
+    interiorCamera.position.set(0, 4, 25);
+    interiorCamera.lookAt(0, 1.5, 0);
     
     renderer.render(interiorScene, interiorCamera);
   }
