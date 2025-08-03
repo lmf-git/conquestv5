@@ -10,6 +10,7 @@
   let interiorPlayerBody, interiorPlayerCollider;
   let stationPlayerBody, stationPlayerCollider;
   let shipBody, shipCollider;
+  let shipEntrySensor, stationEntrySensor;
   // Multi-ship station support - IMPLEMENTED
   let stationShipBodies = []; // Array of ship bodies docked in station  
   let stationShipProxies = []; // Array of ship visual proxies in station interior
@@ -73,6 +74,56 @@
   let mouseX = 0;
   let mouseY = 0;
   let cameraRotation = { yaw: 0, pitch: 0 };
+  
+  // Smooth rotation transition system
+  let rotationTransition = $state({
+    active: false,
+    startYaw: 0,
+    startPitch: 0,
+    targetYaw: 0,
+    targetPitch: 0,
+    progress: 0,
+    duration: 1000 // 1 second transition
+  });
+  
+  // Function to start smooth rotation transition
+  function startRotationTransition(targetYaw, targetPitch, duration = 1000) {
+    rotationTransition.active = true;
+    rotationTransition.startYaw = cameraRotation.yaw;
+    rotationTransition.startPitch = cameraRotation.pitch;
+    rotationTransition.targetYaw = targetYaw;
+    rotationTransition.targetPitch = targetPitch;
+    rotationTransition.progress = 0;
+    rotationTransition.duration = duration;
+    console.log('🔄 Starting rotation transition:', {
+      from: { yaw: rotationTransition.startYaw, pitch: rotationTransition.startPitch },
+      to: { yaw: targetYaw, pitch: targetPitch },
+      duration
+    });
+  }
+  
+  // Function to update rotation transition
+  function updateRotationTransition(deltaTime) {
+    if (!rotationTransition.active) return;
+    
+    rotationTransition.progress += deltaTime;
+    const t = Math.min(rotationTransition.progress / rotationTransition.duration, 1);
+    
+    // Smooth easing function (ease-out)
+    const eased = 1 - Math.pow(1 - t, 3);
+    
+    // Interpolate rotation
+    cameraRotation.yaw = rotationTransition.startYaw + (rotationTransition.targetYaw - rotationTransition.startYaw) * eased;
+    cameraRotation.pitch = rotationTransition.startPitch + (rotationTransition.targetPitch - rotationTransition.startPitch) * eased;
+    
+    // End transition when complete
+    if (t >= 1) {
+      rotationTransition.active = false;
+      cameraRotation.yaw = rotationTransition.targetYaw;
+      cameraRotation.pitch = rotationTransition.targetPitch;
+      console.log('✅ Rotation transition complete');
+    }
+  }
   
   onMount(async () => {
     await RAPIER.init();
@@ -482,7 +533,7 @@
       .setTranslation(0, DOOR_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS - 0.5)
       .setSensor(true)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
-    exteriorWorld.createCollider(shipEntrySensorCollider, body);
+    shipEntrySensor = exteriorWorld.createCollider(shipEntrySensorCollider, body);
   }
   
   function createInteriorPhysics(SHIP_WIDTH, SHIP_HEIGHT, SHIP_LENGTH, WALL_THICKNESS, DOOR_WIDTH, DOOR_HEIGHT) {
@@ -753,7 +804,7 @@
       .setTranslation(0, dockingBayHeight / 2, STATION_LENGTH / 2 - 2.0)
       .setSensor(true)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
-    exteriorWorld.createCollider(stationEntrySensorCollider, stationBody);
+    stationEntrySensor = exteriorWorld.createCollider(stationEntrySensorCollider, stationBody);
     
     createStationInterior();
   }
@@ -1619,11 +1670,23 @@
   }
   
   function immediateExitToExterior() {
-    // Safety check - never allow exterior exit if player was in a docked ship
-    if (isShipDocked || playerProxyContext.hierarchy.includes('station')) {
-      console.log('❌ BLOCKING exterior exit - player was in docked ship, calling exitShip() instead');
+    // Check if ship is actually currently docked (real-time position check)
+    let shipCurrentlyDocked = false;
+    if (isShipDocked) {
+      // Ship marked as docked - verify it's still in station bounds
+      const stationShipPos = stationShipBody.translation();
+      shipCurrentlyDocked = Math.abs(stationShipPos.x) < (STATION_WIDTH/2 - STATION_WALL_THICKNESS) && 
+                           stationShipPos.y > 0 && stationShipPos.y < STATION_HEIGHT &&
+                           Math.abs(stationShipPos.z) < (STATION_LENGTH/2 - STATION_WALL_THICKNESS);
+    }
+    
+    // Safety check - only block exterior exit if ship is actually currently docked
+    if (shipCurrentlyDocked) {
+      console.log('❌ BLOCKING exterior exit - ship currently in station, calling exitShip() instead');
       exitShip();
       return;
+    } else if (isShipDocked || playerProxyContext.hierarchy.includes('station')) {
+      console.log('🔄 Ship undocked during player interior time - allowing direct exterior exit');
     }
     
     console.log('Seamless exit - switching from kinematic to dynamic, preserving natural position');
@@ -3197,7 +3260,9 @@
                 if (otherCollider && otherCollider.isSensor()) {
                   console.log('🔍 Player hitting sensor after undock:', {
                     isSensor: true,
-                    parentIsShipBody: otherCollider.parent() === shipBody,
+                    sensorType: otherCollider === shipEntrySensor ? 'ship' : (otherCollider === stationEntrySensor ? 'station' : 'unknown'),
+                    isShipSensor: otherCollider === shipEntrySensor,
+                    isStationSensor: otherCollider === stationEntrySensor,
                     shipBodyExists: !!shipBody,
                     shipBodyHandle: shipBody?.handle,
                     otherColliderParentHandle: otherCollider.parent()?.handle,
@@ -3205,15 +3270,21 @@
                   });
                 }
                 
-                // Check if colliding with ship door sensor (immediate entry)
-                if (otherCollider && otherCollider.isSensor() && otherCollider.parent() === shipBody) {
+                // Check if colliding with ship door sensor (immediate entry) - use direct reference
+                if (otherCollider === shipEntrySensor) {
                   const playerPos = playerBody.translation();
                   console.log('SHIP ENTRY DETECTED - Deferring entry until after physics step:', playerPos);
                   pendingShipEntry = true;
+                  // Clear any pending station entry since ship entry takes priority
+                  if (pendingStationEntry) {
+                    console.log('Cancelling pending station entry - ship entry takes priority');
+                    pendingStationEntry = false;
+                  }
                 }
                 
-                // Check if colliding with station entry sensor (immediate entry)
-                if (otherCollider && otherCollider.isSensor() && otherCollider.parent() === stationBody && !isInsideStation) {
+                // Check if colliding with station entry sensor (immediate entry) - use direct reference
+                // Only trigger if ship entry is not already pending
+                if (otherCollider === stationEntrySensor && !isInsideStation && !pendingShipEntry) {
                   const playerPos = playerBody.translation();
                   console.log('STATION ENTRY DETECTED - Deferring entry until after physics step:', playerPos);
                   pendingStationEntry = true;
@@ -3352,6 +3423,11 @@
         // Process deferred entry actions after all physics steps are complete
         if (pendingShipEntry && !isEntering) {
           pendingShipEntry = false;
+          // Clear any pending station entry since ship entry takes priority
+          if (pendingStationEntry) {
+            console.log('Clearing pending station entry - ship entry being processed');
+            pendingStationEntry = false;
+          }
           console.log('PROCESSING DEFERRED SHIP ENTRY');
           immediateEnterInterior();
         }
