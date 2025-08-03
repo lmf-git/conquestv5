@@ -2006,9 +2006,25 @@
     createShipColliders(shipBody);
     
     // Activate ship physics in station world
+    // First, ensure station ship body is dynamic (it might be kinematic from previous undocking)
+    stationShipBody.setBodyType(RAPIER.RigidBodyType.Dynamic);
+    
+    // Clear any accumulated forces/impulses and reset physics state
+    stationShipBody.resetForces(true);
+    stationShipBody.resetTorques(true);
+    
+    // Set clean position, rotation, and velocity
     stationShipBody.setTranslation({ x: relativeX, y: relativeY, z: relativeZ }, true);
     stationShipBody.setRotation(currentShipRot, true);
-    stationShipBody.setLinvel({ x: currentShipVel.x, y: currentShipVel.y, z: currentShipVel.z }, true);
+    
+    // Apply reduced velocity to prevent weird momentum carryover
+    const velocityDamping = 0.5; // Reduce velocity for smoother docking
+    stationShipBody.setLinvel({ 
+      x: currentShipVel.x * velocityDamping, 
+      y: currentShipVel.y * velocityDamping, 
+      z: currentShipVel.z * velocityDamping 
+    }, true);
+    stationShipBody.setAngvel({ x: 0, y: 0, z: 0 }, true); // Clear angular velocity for stability
     
     // Log the ship body and its sensors for debugging
     console.log('Station ship body activated at:', stationShipBody.translation());
@@ -2050,10 +2066,16 @@
     const stationShipAngVel = stationShipBody.angvel();
     const stationPos = stationBody.translation();
     
-    // Transform station-relative position back to world coordinates (reverse of entry transformation)
-    const worldX = stationShipPos.x + stationPos.x;
-    const worldY = stationShipPos.y + stationPos.y;
-    const worldZ = stationShipPos.z + stationPos.z;
+    // Transform station-relative position back to world coordinates
+    // Apply proper coordinate transformation considering station rotation
+    const stationRot = stationBody.rotation();
+    const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
+    const relativePos = new THREE.Vector3(stationShipPos.x, stationShipPos.y, stationShipPos.z);
+    relativePos.applyQuaternion(stationQuat);
+    
+    const worldX = stationPos.x + relativePos.x;
+    const worldY = stationPos.y + relativePos.y;
+    const worldZ = stationPos.z + relativePos.z;
     
     // Convert kinematic ship back to dynamic body (exact ship exit pattern)
     console.log('Removing kinematic body...');
@@ -2067,9 +2089,15 @@
     exteriorWorld.removeRigidBody(shipBody);
     
     console.log('Creating new dynamic body at:', { x: worldX, y: worldY, z: worldZ });
+    
+    // Transform rotation from station space to world space
+    const stationQuat4 = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
+    const shipQuat = new THREE.Quaternion(stationShipRot.x, stationShipRot.y, stationShipRot.z, stationShipRot.w);
+    const worldRotation = stationQuat4.multiply(shipQuat);
+    
     const dynamicShipBodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(worldX, worldY, worldZ)
-      .setRotation(stationShipRot)
+      .setRotation({ x: worldRotation.x, y: worldRotation.y, z: worldRotation.z, w: worldRotation.w })
       .setCanSleep(false)
       .setLinearDamping(0.5)
       .setAngularDamping(2.0);
@@ -2078,9 +2106,23 @@
     console.log('New dynamic body created with handle:', shipBody.handle);
     console.log('Body type is now:', shipBody.bodyType());
     
-    // Maintain velocity from station simulation
-    shipBody.setLinvel({ x: stationShipVel.x, y: stationShipVel.y, z: stationShipVel.z }, true);
-    shipBody.setAngvel({ x: stationShipAngVel.x, y: stationShipAngVel.y, z: stationShipAngVel.z }, true);
+    // Clear residual velocity for clean undocking (let physics take over naturally)
+    // Transform velocity to world coordinates if needed, or clear for clean slate
+    const transformedVel = new THREE.Vector3(stationShipVel.x, stationShipVel.y, stationShipVel.z);
+    transformedVel.applyQuaternion(stationQuat);
+    
+    // Apply minimal velocity to prevent physics instability, but reduce momentum carryover
+    const dampingFactor = 0.3; // Reduce carried momentum significantly
+    shipBody.setLinvel({ 
+      x: transformedVel.x * dampingFactor, 
+      y: transformedVel.y * dampingFactor, 
+      z: transformedVel.z * dampingFactor 
+    }, true);
+    shipBody.setAngvel({ 
+      x: stationShipAngVel.x * dampingFactor, 
+      y: stationShipAngVel.y * dampingFactor, 
+      z: stationShipAngVel.z * dampingFactor 
+    }, true);
     
     // Recreate ship colliders using same function as initial creation
     createShipColliders(shipBody);
@@ -2092,11 +2134,17 @@
     
     // Ship physics body created with colliders (removed detailed logs)
     
-    // Force a small forward impulse to ensure physics activation
-    shipBody.applyImpulse({ x: 0, y: 0, z: 1 }, true);
+    // Clear any residual forces to ensure clean physics state
+    shipBody.resetForces(true);
+    shipBody.resetTorques(true);
     
     // Deactivate station ship physics - move far away and make it kinematic to stop physics
     stationShipBody.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased);
+    
+    // Clear all forces and reset physics state before deactivating
+    stationShipBody.resetForces(true);
+    stationShipBody.resetTorques(true);
+    
     stationShipBody.setTranslation({ x: 0, y: -1000, z: 0 }, true);
     stationShipBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
     stationShipBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
@@ -3270,8 +3318,10 @@
                   });
                 }
                 
-                // Check if colliding with ship door sensor (immediate entry) - use direct reference
-                if (otherCollider === shipEntrySensor) {
+                // Check if colliding with ship door sensor (immediate entry) - use more robust detection
+                const isShipSensor = (otherCollider === shipEntrySensor) || 
+                                   (otherCollider?.parent()?.handle === shipBody?.handle && otherCollider?.isSensor());
+                if (isShipSensor) {
                   const playerPos = playerBody.translation();
                   console.log('SHIP ENTRY DETECTED - Deferring entry until after physics step:', playerPos);
                   pendingShipEntry = true;
@@ -3480,21 +3530,24 @@
           };
         }
         
-        // Check bounds based on whether ship is docked or not
+        // Use consistent docking bay bounds regardless of docked state
+        // Focus on the actual docking bay entrance area, not the full station interior
+        const dockingBayWidth = 60; // Width of docking bay opening
+        const dockingBayHeight = 30; // Height of docking bay opening
+        const dockingBayDepth = 40; // How deep into station counts as "docked"
+        
         let xInBounds, yInBounds, zInBounds;
         
         if (isShipDocked) {
-          // When docked, shipRelativeToStation is in station world coordinates
-          // Station interior bounds in station world: floor at Y=1, ceiling at Y=59
+          // When docked, use generous interior bounds to prevent oscillation
           xInBounds = Math.abs(shipRelativeToStation.x) < (STATION_WIDTH/2 - STATION_WALL_THICKNESS);
           yInBounds = shipRelativeToStation.y > 0 && shipRelativeToStation.y < STATION_HEIGHT;
           zInBounds = Math.abs(shipRelativeToStation.z) < (STATION_LENGTH/2 - STATION_WALL_THICKNESS);
         } else {
-          // When not docked, use exterior world bounds
-          // Station floor at Y=STATION_WALL_THICKNESS=2.0, ceiling at Y=STATION_HEIGHT-STATION_WALL_THICKNESS=58.0
-          xInBounds = Math.abs(shipRelativeToStation.x) < (STATION_WIDTH/2 - STATION_WALL_THICKNESS);
-          yInBounds = shipRelativeToStation.y > (STATION_WALL_THICKNESS - 0.1) && shipRelativeToStation.y < (STATION_HEIGHT - STATION_WALL_THICKNESS + 0.1);
-          zInBounds = Math.abs(shipRelativeToStation.z) < (STATION_LENGTH/2 - STATION_WALL_THICKNESS);
+          // When not docked, use focused docking bay entrance detection
+          xInBounds = Math.abs(shipRelativeToStation.x) < dockingBayWidth/2;
+          yInBounds = shipRelativeToStation.y > (STATION_WALL_THICKNESS - 1.0) && shipRelativeToStation.y < dockingBayHeight;
+          zInBounds = shipRelativeToStation.z > (STATION_LENGTH/2 - dockingBayDepth) && shipRelativeToStation.z < (STATION_LENGTH/2 + 5);
         }
         
         isShipInDockingBay = xInBounds && yInBounds && zInBounds;
@@ -3520,14 +3573,14 @@
           const currentTime = Date.now();
           const timeSinceUndock = currentTime - lastUndockTime;
           
-          // Check if ship should dock with cooldown
-          if (timeSinceUndock > 2000 && isShipInDockingBay) { // 2 second cooldown after undocking
+          // Check if ship should dock with minimal cooldown (rely on natural physics for spacing)
+          if (timeSinceUndock > 200 && isShipInDockingBay) { // 0.2 second cooldown to prevent frame-based oscillation
             console.log('SHIP DOCKING DETECTED (position-based) - Deferring docking until after physics step');
             pendingShipDocking = true;
           }
         } else if (isShipDocked) {
-          // Ship undocking logic - use same simple pattern as docking but with generous buffer
-          const undockBuffer = 5.0; // Extra room before undocking (prevents immediate undocking)
+          // Ship undocking logic - use generous buffer to prevent oscillation
+          const undockBuffer = 15.0; // Large buffer to prevent immediate undocking after docking
           
           const xOutOfBounds = Math.abs(shipRelativeToStation.x) > (STATION_WIDTH/2 - STATION_WALL_THICKNESS + undockBuffer);
           const yOutOfBounds = shipRelativeToStation.y < (STATION_WALL_THICKNESS - 0.1 - undockBuffer) || shipRelativeToStation.y > (STATION_HEIGHT - STATION_WALL_THICKNESS + 0.1 + undockBuffer);
