@@ -10,22 +10,63 @@
   let interiorPlayerBody, interiorPlayerCollider;
   let stationPlayerBody, stationPlayerCollider;
   let shipBody, shipCollider;
-  let stationShipBody, stationShipCollider; // Ship physics inside station
+  // Multi-ship station support - IMPLEMENTED
+  let stationShipBodies = []; // Array of ship bodies docked in station  
+  let stationShipProxies = []; // Array of ship visual proxies in station interior
+  let activeShipIndex = 0; // Which ship player is currently in
+  let nextShipId = 0; // For generating unique ship IDs
+  // This allows: player exits ship A → walks in station → enters ship B
+  
+  // Compatibility layer - these point to the active ship
+  let stationShipBody, stationShipProxy;
   let stationBody, stationCollider;
   let isInsideShip = $state(false);
   let isInsideStation = $state(false);
   let isShipDocked = $state(false);
+  let prevIsShipDocked = $state(false);
+  let prevIsShipInDockingBay = $state(false);
   // Ship docking is now immediate like player entry - no transition states needed
   let shipInteriorProxy, stationInteriorProxy;
+  
+  // Proxy-aware state management system
+  // Represents the nested hierarchy: Exterior -> Station -> Ship
+  let playerProxyContext = $state({
+    activeWorld: 'exterior', // 'exterior' | 'station' | 'ship'
+    hierarchy: [], // Array representing nesting: [] = exterior, ['station'] = in station, ['station', 'ship'] = in docked ship
+    activePhysicsBody: null, // Current physics body being used
+    lastTransition: Date.now()
+  });
+  
+  // Derived states based on proxy context
+  let isInExterior = $derived(playerProxyContext.activeWorld === 'exterior');
+  let isInStation = $derived(playerProxyContext.activeWorld === 'station');
+  let isInShip = $derived(playerProxyContext.activeWorld === 'ship');
+  let isInDockedShip = $derived(playerProxyContext.hierarchy.includes('station') && playerProxyContext.hierarchy.includes('ship'));
   let transitionProgress = $state(0); // 0 = fully outside, 1 = fully inside
   let isTransitioning = $state(false);
   let isExiting = $state(false);
   let isEntering = $state(false);
   let pendingShipEntry = $state(false);
+  // Ship dimensions - constants used throughout
+  const SHIP_WIDTH = 20;
+  const SHIP_HEIGHT = 6;
+  const SHIP_LENGTH = 30;
+  const WALL_THICKNESS = 0.4;
+  const DOOR_WIDTH = 4;
+  const DOOR_HEIGHT = 4;
+  
+  // Station dimensions - constants used throughout  
+  const STATION_WIDTH = 200;
+  const STATION_HEIGHT = 60;
+  const STATION_LENGTH = 250;
+  const STATION_WALL_THICKNESS = 2.0;
+
   let pendingStationEntry = $state(false);
   let pendingShipDocking = $state(false);
   let lastUndockTime = $state(0); // Cooldown to prevent immediate re-docking
   let lastShipExitToStationTime = $state(0); // Cooldown to prevent station re-entry after ship exit
+  let lastShipExitToExteriorTime = $state(0); // Cooldown to prevent ship re-entry after ship exit to exterior
+  let lastStationEntryTime = $state(0); // Prevent immediate exit after station entry
   let pendingShipEntryFromStation = $state(false); // Deferred ship entry from station
   let isFirstPerson = $state(false);
   let isPointerLocked = $state(false);
@@ -51,10 +92,11 @@
     exteriorCamera.position.set(0, 5, 10);
     
     interiorCamera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    interiorCamera.position.set(0, 4, 12);
+    interiorCamera.position.set(0, 4, 25); // Zoomed out more for better overview
+    interiorCamera.lookAt(0, 1.5, 0); // Set fixed angle looking forward - never change this
     
     stationCamera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    stationCamera.position.set(0, 40, 100);
+    stationCamera.position.set(0, 80, 200); // Zoomed out much more for better overview
     
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -122,7 +164,7 @@
   });
   
   function createGround() {
-    const groundGeometry = new THREE.BoxGeometry(1000, 1, 1000);
+    const groundGeometry = new THREE.BoxGeometry(2000, 1, 2000);
     const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x808080 });
     const groundMesh = new THREE.Mesh(groundGeometry, groundMaterial);
     groundMesh.receiveShadow = true;
@@ -132,7 +174,7 @@
     const groundBodyDesc = RAPIER.RigidBodyDesc.fixed()
       .setTranslation(0, -0.5, 0);
     const groundBody = exteriorWorld.createRigidBody(groundBodyDesc);
-    const groundColliderDesc = RAPIER.ColliderDesc.cuboid(500, 0.5, 500);
+    const groundColliderDesc = RAPIER.ColliderDesc.cuboid(1000, 0.5, 1000);
     exteriorWorld.createCollider(groundColliderDesc, groundBody);
   }
   
@@ -144,11 +186,103 @@
   let jumpPressed = false;
   let canJump = true;
   
+  // Proxy context management functions
+  function updatePlayerProxyContext(newWorld, newHierarchy, newPhysicsBody) {
+    console.log(`🌍 Proxy context transition: ${playerProxyContext.activeWorld} -> ${newWorld}`, {
+      oldHierarchy: playerProxyContext.hierarchy,
+      newHierarchy: newHierarchy,
+      timestamp: Date.now()
+    });
+    
+    playerProxyContext.activeWorld = newWorld;
+    playerProxyContext.hierarchy = [...newHierarchy];
+    playerProxyContext.activePhysicsBody = newPhysicsBody;
+    playerProxyContext.lastTransition = Date.now();
+    
+    // Update legacy state flags for compatibility
+    isInsideShip = newWorld === 'ship';
+    isInsideStation = newWorld === 'station' || newHierarchy.includes('station');
+  }
+  
+  function enterExteriorWorld(physicsBody) {
+    updatePlayerProxyContext('exterior', [], physicsBody);
+  }
+  
+  function enterStationWorld(physicsBody) {
+    updatePlayerProxyContext('station', ['station'], physicsBody);
+  }
+  
+  function enterShipFromExteriorContext(physicsBody) {
+    updatePlayerProxyContext('ship', ['ship'], physicsBody);
+  }
+  
+  function enterShipFromStationContext(physicsBody) {
+    updatePlayerProxyContext('ship', ['station', 'ship'], physicsBody);
+  }
+  
+  function exitToStation(physicsBody) {
+    updatePlayerProxyContext('station', ['station'], physicsBody);
+  }
+  
+  function exitToExterior(physicsBody) {
+    updatePlayerProxyContext('exterior', [], physicsBody);
+  }
+  
+  // Physics-based proxy detection system
+  function detectActiveProxyFromPhysics() {
+    let activeWorld = 'exterior';
+    let hierarchy = [];
+    let activePhysicsBody = playerBody;
+    
+    // Check which physics body is actually at a reasonable position (not hidden)
+    try {
+      const exteriorPos = playerBody?.translation();
+      const stationPos = stationPlayerBody?.translation();
+      const interiorPos = interiorPlayerBody?.translation();
+      
+      // Determine active physics body based on which one is at a reasonable position
+      if (interiorPos && interiorPos.y > -50) {
+        // Interior player is active (not at initialization position -100)
+        activeWorld = 'ship';
+        activePhysicsBody = interiorPlayerBody;
+        
+        // Check if ship is docked to determine hierarchy
+        if (isShipDocked) {
+          hierarchy = ['station', 'ship'];
+        } else {
+          hierarchy = ['ship'];
+        }
+      } else if (stationPos && stationPos.y > -150) {
+        // Station player is active (not at initialization position -200)
+        activeWorld = 'station';
+        hierarchy = ['station'];
+        activePhysicsBody = stationPlayerBody;
+      } else if (exteriorPos && exteriorPos.y > -10) {
+        // Exterior player is active
+        activeWorld = 'exterior';
+        hierarchy = [];
+        activePhysicsBody = playerBody;
+      }
+      
+      // Only update if there's an actual change AND not during transitions
+      // This prevents the detection from interfering with ongoing transitions
+      if (activeWorld !== playerProxyContext.activeWorld && !isTransitioning && !isEntering && !isExiting) {
+        console.log(`🔍 Physics-based proxy detection: ${playerProxyContext.activeWorld} -> ${activeWorld}`);
+        updatePlayerProxyContext(activeWorld, hierarchy, activePhysicsBody);
+      }
+      
+    } catch (error) {
+      console.warn('Error in physics-based proxy detection:', error);
+    }
+  }
+  
   // Debug HUD reactive states
   let playerPosition = $state({ x: 0, y: 0, z: 0 });
   let playerVelocity = $state({ x: 0, y: 0, z: 0 });
-  let currentWorld = $derived(isInsideShip ? 'Ship Interior' : (isInsideStation ? 'Station Interior' : 'Exterior'));
+  let currentWorld = $derived(playerProxyContext.activeWorld === 'ship' ? 'Ship Interior' : 
+                            (playerProxyContext.activeWorld === 'station' ? 'Station Interior' : 'Exterior'));
   let shipWorld = $derived(isShipDocked ? 'Station Interior' : 'Exterior');
+  let proxyHierarchy = $derived(playerProxyContext.hierarchy.join(' > ') || 'exterior');
   let movementStatus = $derived(isGrounded ? 'Grounded' : 'Falling');
   let fps = $state(0);
   let frameCount = 0;
@@ -172,6 +306,9 @@
       .setAngularDamping(5.0)
       .lockRotations();
     playerBody = exteriorWorld.createRigidBody(playerBodyDesc);
+    
+    // Initialize proxy context to exterior world
+    enterExteriorWorld(playerBody);
     
     const playerColliderDesc = RAPIER.ColliderDesc.capsule(capsuleHeight / 2, capsuleRadius)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS)
@@ -216,75 +353,71 @@
   
   function createShip() {
     const shipGroup = new THREE.Group();
-    const wallThickness = 0.4;
-    const shipWidth = 20;
-    const shipHeight = 6;
-    const shipLength = 30;
     
     const hullMaterial = new THREE.MeshStandardMaterial({ color: 0x444444 });
     
     // Floor
-    const floorGeometry = new THREE.BoxGeometry(shipWidth, wallThickness, shipLength);
+    const floorGeometry = new THREE.BoxGeometry(SHIP_WIDTH, WALL_THICKNESS, SHIP_LENGTH);
     const floorMesh = new THREE.Mesh(floorGeometry, hullMaterial);
     floorMesh.castShadow = true;
     floorMesh.receiveShadow = true;
-    floorMesh.position.set(0, wallThickness / 2, 0);
+    floorMesh.position.set(0, WALL_THICKNESS / 2, 0);
     shipGroup.add(floorMesh);
     
     // Ceiling
-    const ceilingGeometry = new THREE.BoxGeometry(shipWidth, wallThickness, shipLength);
+    const ceilingGeometry = new THREE.BoxGeometry(SHIP_WIDTH, WALL_THICKNESS, SHIP_LENGTH);
     const ceilingMesh = new THREE.Mesh(ceilingGeometry, hullMaterial);
-    ceilingMesh.position.set(0, shipHeight - wallThickness / 2, 0);
+    ceilingMesh.position.set(0, SHIP_HEIGHT - STATION_WALL_THICKNESS / 2, 0);
     shipGroup.add(ceilingMesh);
     
     // Left wall
-    const leftWallGeometry = new THREE.BoxGeometry(wallThickness, shipHeight, shipLength);
+    const leftWallGeometry = new THREE.BoxGeometry(WALL_THICKNESS, SHIP_HEIGHT, SHIP_LENGTH);
     const leftWallMesh = new THREE.Mesh(leftWallGeometry, hullMaterial);
-    leftWallMesh.position.set(-shipWidth / 2 + wallThickness / 2, shipHeight / 2, 0);
+    leftWallMesh.position.set(-SHIP_WIDTH / 2 + WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0);
     shipGroup.add(leftWallMesh);
     
     // Right wall
-    const rightWallGeometry = new THREE.BoxGeometry(wallThickness, shipHeight, shipLength);
+    const rightWallGeometry = new THREE.BoxGeometry(WALL_THICKNESS, SHIP_HEIGHT, SHIP_LENGTH);
     const rightWallMesh = new THREE.Mesh(rightWallGeometry, hullMaterial);
-    rightWallMesh.position.set(shipWidth / 2 - wallThickness / 2, shipHeight / 2, 0);
+    rightWallMesh.position.set(SHIP_WIDTH / 2 - WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0);
     shipGroup.add(rightWallMesh);
     
     // Back wall
-    const backWallGeometry = new THREE.BoxGeometry(shipWidth, shipHeight, wallThickness);
+    const backWallGeometry = new THREE.BoxGeometry(SHIP_WIDTH, SHIP_HEIGHT, WALL_THICKNESS);
     const backWallMesh = new THREE.Mesh(backWallGeometry, hullMaterial);
-    backWallMesh.position.set(0, shipHeight / 2, -shipLength / 2 + wallThickness / 2);
+    backWallMesh.position.set(0, SHIP_HEIGHT / 2, -SHIP_LENGTH / 2 + WALL_THICKNESS / 2);
     shipGroup.add(backWallMesh);
     
     // Front wall with door opening (bigger door)
-    const doorWidth = 4;
-    const doorHeight = 4;
+    const DOOR_WIDTH = 4;
+    const DOOR_HEIGHT = 4;
     
     const frontWallLeft = new THREE.Mesh(
-      new THREE.BoxGeometry((shipWidth - doorWidth) / 2, shipHeight, wallThickness),
+      new THREE.BoxGeometry((SHIP_WIDTH - DOOR_WIDTH) / 2, SHIP_HEIGHT, WALL_THICKNESS),
       hullMaterial
     );
-    frontWallLeft.position.set(-(shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2);
+    frontWallLeft.position.set(-(SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
     shipGroup.add(frontWallLeft);
     
     const frontWallRight = new THREE.Mesh(
-      new THREE.BoxGeometry((shipWidth - doorWidth) / 2, shipHeight, wallThickness),
+      new THREE.BoxGeometry((SHIP_WIDTH - DOOR_WIDTH) / 2, SHIP_HEIGHT, WALL_THICKNESS),
       hullMaterial
     );
-    frontWallRight.position.set((shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2);
+    frontWallRight.position.set((SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
     shipGroup.add(frontWallRight);
     
     const frontWallTop = new THREE.Mesh(
-      new THREE.BoxGeometry(doorWidth, shipHeight - doorHeight, wallThickness),
+      new THREE.BoxGeometry(DOOR_WIDTH, SHIP_HEIGHT - DOOR_HEIGHT, WALL_THICKNESS),
       hullMaterial
     );
-    frontWallTop.position.set(0, shipHeight - (shipHeight - doorHeight) / 2, shipLength / 2 - wallThickness / 2);
+    frontWallTop.position.set(0, SHIP_HEIGHT - (SHIP_HEIGHT - DOOR_HEIGHT) / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
     shipGroup.add(frontWallTop);
     
     // Deck on top
-    const deckGeometry = new THREE.BoxGeometry(shipWidth - 1, wallThickness, shipLength - 2);
+    const deckGeometry = new THREE.BoxGeometry(SHIP_WIDTH - 1, WALL_THICKNESS, SHIP_LENGTH - 2);
     const deckMaterial = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
     const deckMesh = new THREE.Mesh(deckGeometry, deckMaterial);
-    deckMesh.position.y = shipHeight + wallThickness / 2;
+    deckMesh.position.y = SHIP_HEIGHT + WALL_THICKNESS / 2;
     shipGroup.add(deckMesh);
     
     shipMesh = shipGroup;
@@ -292,112 +425,129 @@
     exteriorScene.add(shipMesh);
     
     const shipBodyDesc = RAPIER.RigidBodyDesc.dynamic()
-      .setTranslation(0, 5, 0) // Start above ground
+      .setTranslation(0, 6, 0) // Start above ground (adjusted for new floor position)
       .setCanSleep(false)
       .setLinearDamping(0.5)
       .setAngularDamping(2.0);
     shipBody = exteriorWorld.createRigidBody(shipBodyDesc);
     
-    // Create compound colliders for each ship part in exterior world
-    const floorCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, wallThickness / 2, shipLength / 2)
-      .setTranslation(0, wallThickness / 2, 0);
-    exteriorWorld.createCollider(floorCollider, shipBody);
-    
-    const ceilingCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, wallThickness / 2, shipLength / 2)
-      .setTranslation(0, shipHeight - wallThickness / 2, 0);
-    exteriorWorld.createCollider(ceilingCollider, shipBody);
-    
-    const leftWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2)
-      .setTranslation(-shipWidth / 2 + wallThickness / 2, shipHeight / 2, 0);
-    exteriorWorld.createCollider(leftWallCollider, shipBody);
-    
-    const rightWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2)
-      .setTranslation(shipWidth / 2 - wallThickness / 2, shipHeight / 2, 0);
-    exteriorWorld.createCollider(rightWallCollider, shipBody);
-    
-    const backWallCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, shipHeight / 2, wallThickness / 2)
-      .setTranslation(0, shipHeight / 2, -shipLength / 2 + wallThickness / 2);
-    exteriorWorld.createCollider(backWallCollider, shipBody);
-    
-    // Front wall colliders (with door opening)
-    const frontWallLeftCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2)
-      .setTranslation(-(shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2);
-    exteriorWorld.createCollider(frontWallLeftCollider, shipBody);
-    
-    const frontWallRightCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2)
-      .setTranslation((shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2);
-    exteriorWorld.createCollider(frontWallRightCollider, shipBody);
-    
-    const frontWallTopCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2, (shipHeight - doorHeight) / 2, wallThickness / 2)
-      .setTranslation(0, shipHeight - (shipHeight - doorHeight) / 2, shipLength / 2 - wallThickness / 2);
-    exteriorWorld.createCollider(frontWallTopCollider, shipBody);
-
-    // Create exterior door sensor attached to ship body for ship entry detection
-    // Position it well inside the ship so player must be fully through the door
-    const exteriorDoorSensorCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2 - 0.5, doorHeight / 2 - 0.5, 0.1)
-      .setTranslation(0, doorHeight / 2, shipLength / 2 - wallThickness - 2.0)
-      .setSensor(true)
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
-    exteriorWorld.createCollider(exteriorDoorSensorCollider, shipBody);
+    // Create ship colliders
+    createShipColliders(shipBody);
     
     // Create interior world physics (stationary ship interior)
-    createInteriorPhysics(shipWidth, shipHeight, shipLength, wallThickness, doorWidth, doorHeight);
+    createInteriorPhysics(SHIP_WIDTH, SHIP_HEIGHT, SHIP_LENGTH, WALL_THICKNESS, DOOR_WIDTH, DOOR_HEIGHT);
     
     createShipInterior();
   }
+
+  function createShipColliders(body) {
+    // Use global constants
+    
+    // Ship structure colliders
+    const floorCollider = RAPIER.ColliderDesc.cuboid(SHIP_WIDTH / 2, WALL_THICKNESS / 2, SHIP_LENGTH / 2)
+      .setTranslation(0, WALL_THICKNESS / 2, 0);
+    exteriorWorld.createCollider(floorCollider, body);
+    
+    const ceilingCollider = RAPIER.ColliderDesc.cuboid(SHIP_WIDTH / 2, WALL_THICKNESS / 2, SHIP_LENGTH / 2)
+      .setTranslation(0, SHIP_HEIGHT - WALL_THICKNESS / 2, 0);
+    exteriorWorld.createCollider(ceilingCollider, body);
+    
+    const leftWallCollider = RAPIER.ColliderDesc.cuboid(WALL_THICKNESS / 2, SHIP_HEIGHT / 2, SHIP_LENGTH / 2)
+      .setTranslation(-SHIP_WIDTH / 2 + WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0);
+    exteriorWorld.createCollider(leftWallCollider, body);
+    
+    const rightWallCollider = RAPIER.ColliderDesc.cuboid(WALL_THICKNESS / 2, SHIP_HEIGHT / 2, SHIP_LENGTH / 2)
+      .setTranslation(SHIP_WIDTH / 2 - WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0);
+    exteriorWorld.createCollider(rightWallCollider, body);
+    
+    const backWallCollider = RAPIER.ColliderDesc.cuboid(SHIP_WIDTH / 2, SHIP_HEIGHT / 2, WALL_THICKNESS / 2)
+      .setTranslation(0, SHIP_HEIGHT / 2, -SHIP_LENGTH / 2 + WALL_THICKNESS / 2);
+    exteriorWorld.createCollider(backWallCollider, body);
+    
+    // Front wall colliders (with door opening)
+    const frontWallLeftCollider = RAPIER.ColliderDesc.cuboid((SHIP_WIDTH - DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, WALL_THICKNESS / 2)
+      .setTranslation(-(SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
+    exteriorWorld.createCollider(frontWallLeftCollider, body);
+    
+    const frontWallRightCollider = RAPIER.ColliderDesc.cuboid((SHIP_WIDTH - DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, WALL_THICKNESS / 2)
+      .setTranslation((SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
+    exteriorWorld.createCollider(frontWallRightCollider, body);
+    
+    const frontWallTopCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2, (SHIP_HEIGHT - DOOR_HEIGHT) / 2, WALL_THICKNESS / 2)
+      .setTranslation(0, SHIP_HEIGHT - (SHIP_HEIGHT - DOOR_HEIGHT) / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
+    exteriorWorld.createCollider(frontWallTopCollider, body);
+    
+    // Create ship entry sensor for player detection in exterior world - small and inside door threshold
+    const shipEntrySensorCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2 - 0.2, DOOR_HEIGHT / 2 - 0.2, 0.3)
+      .setTranslation(0, DOOR_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS - 0.5)
+      .setSensor(true)
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+    exteriorWorld.createCollider(shipEntrySensorCollider, body);
+  }
   
-  function createInteriorPhysics(shipWidth, shipHeight, shipLength, wallThickness, doorWidth, doorHeight) {
+  function createInteriorPhysics(SHIP_WIDTH, SHIP_HEIGHT, SHIP_LENGTH, WALL_THICKNESS, DOOR_WIDTH, DOOR_HEIGHT) {
     // Create stationary interior physics world at origin
-    // Floor positioned at y = wallThickness/2 to match visual floor
+    // Floor positioned at y = WALL_THICKNESS/2 to match visual floor
     const interiorFloorBody = interiorWorld.createRigidBody(
-      RAPIER.RigidBodyDesc.fixed().setTranslation(0, wallThickness / 2, 0)
+      RAPIER.RigidBodyDesc.fixed().setTranslation(0, WALL_THICKNESS / 2, 0)
     );
     const interiorFloorCollider = RAPIER.ColliderDesc.cuboid(
-      shipWidth / 2 - wallThickness, 
-      wallThickness / 2, 
-      shipLength / 2 - wallThickness
+      SHIP_WIDTH / 2 - WALL_THICKNESS, 
+      WALL_THICKNESS / 2, 
+      SHIP_LENGTH / 2 - WALL_THICKNESS
     );
     interiorWorld.createCollider(interiorFloorCollider, interiorFloorBody);
 
+    // Ceiling positioned at y = SHIP_HEIGHT - WALL_THICKNESS/2 to match visual ceiling
+    const interiorCeilingBody = interiorWorld.createRigidBody(
+      RAPIER.RigidBodyDesc.fixed().setTranslation(0, SHIP_HEIGHT - WALL_THICKNESS / 2, 0)
+    );
+    const interiorCeilingCollider = RAPIER.ColliderDesc.cuboid(
+      SHIP_WIDTH / 2 - WALL_THICKNESS, 
+      WALL_THICKNESS / 2, 
+      SHIP_LENGTH / 2 - WALL_THICKNESS
+    );
+    interiorWorld.createCollider(interiorCeilingCollider, interiorCeilingBody);
+
     // Create sensor to detect when player enters door area in interior world
     const interiorDoorSensorBody = interiorWorld.createRigidBody(
-      RAPIER.RigidBodyDesc.fixed().setTranslation(0, doorHeight / 2, shipLength / 2 - wallThickness)
+      RAPIER.RigidBodyDesc.fixed().setTranslation(0, DOOR_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS)
     );
-    const interiorDoorSensorCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2, doorHeight / 2, wallThickness / 2)
+    const interiorDoorSensorCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2, DOOR_HEIGHT / 2, WALL_THICKNESS / 2)
       .setSensor(true)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     interiorWorld.createCollider(interiorDoorSensorCollider, interiorDoorSensorBody);
     
-    console.log('Created interior floor at y:', wallThickness / 2, 'size:', {
-      width: shipWidth - wallThickness * 2,
-      height: wallThickness,
-      length: shipLength - wallThickness * 2
+    console.log('Created interior floor at y:', WALL_THICKNESS / 2, 'size:', {
+      width: SHIP_WIDTH - WALL_THICKNESS * 2,
+      height: WALL_THICKNESS,
+      length: SHIP_LENGTH - WALL_THICKNESS * 2
     });
     
     // Interior walls
-    const interiorLeftWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-shipWidth / 2 + wallThickness / 2, shipHeight / 2, 0));
-    const interiorLeftWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2);
+    const interiorLeftWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-SHIP_WIDTH / 2 + WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0));
+    const interiorLeftWallCollider = RAPIER.ColliderDesc.cuboid(WALL_THICKNESS / 2, SHIP_HEIGHT / 2, SHIP_LENGTH / 2);
     interiorWorld.createCollider(interiorLeftWallCollider, interiorLeftWallBody);
     
-    const interiorRightWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(shipWidth / 2 - wallThickness / 2, shipHeight / 2, 0));
-    const interiorRightWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2);
+    const interiorRightWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(SHIP_WIDTH / 2 - WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0));
+    const interiorRightWallCollider = RAPIER.ColliderDesc.cuboid(WALL_THICKNESS / 2, SHIP_HEIGHT / 2, SHIP_LENGTH / 2);
     interiorWorld.createCollider(interiorRightWallCollider, interiorRightWallBody);
     
-    const interiorBackWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, shipHeight / 2, -shipLength / 2 + wallThickness / 2));
-    const interiorBackWallCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, shipHeight / 2, wallThickness / 2);
+    const interiorBackWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, SHIP_HEIGHT / 2, -SHIP_LENGTH / 2 + WALL_THICKNESS / 2));
+    const interiorBackWallCollider = RAPIER.ColliderDesc.cuboid(SHIP_WIDTH / 2, SHIP_HEIGHT / 2, WALL_THICKNESS / 2);
     interiorWorld.createCollider(interiorBackWallCollider, interiorBackWallBody);
     
     // Front walls with door opening
-    const interiorFrontLeftWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-(shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2));
-    const interiorFrontLeftWallCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2);
+    const interiorFrontLeftWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-(SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2));
+    const interiorFrontLeftWallCollider = RAPIER.ColliderDesc.cuboid((SHIP_WIDTH - DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, WALL_THICKNESS / 2);
     interiorWorld.createCollider(interiorFrontLeftWallCollider, interiorFrontLeftWallBody);
     
-    const interiorFrontRightWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation((shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2));
-    const interiorFrontRightWallCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2);
+    const interiorFrontRightWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation((SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2));
+    const interiorFrontRightWallCollider = RAPIER.ColliderDesc.cuboid((SHIP_WIDTH - DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, WALL_THICKNESS / 2);
     interiorWorld.createCollider(interiorFrontRightWallCollider, interiorFrontRightWallBody);
     
-    const interiorFrontTopWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, shipHeight - (shipHeight - doorHeight) / 2, shipLength / 2 - wallThickness / 2));
-    const interiorFrontTopWallCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2, (shipHeight - doorHeight) / 2, wallThickness / 2);
+    const interiorFrontTopWallBody = interiorWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, SHIP_HEIGHT - (SHIP_HEIGHT - DOOR_HEIGHT) / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2));
+    const interiorFrontTopWallCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2, (SHIP_HEIGHT - DOOR_HEIGHT) / 2, WALL_THICKNESS / 2);
     interiorWorld.createCollider(interiorFrontTopWallCollider, interiorFrontTopWallBody);
   }
   
@@ -405,16 +555,10 @@
     shipInteriorProxy = new THREE.Group();
     
     // Use actual ship dimensions for consistency
-    const shipWidth = 20;
-    const shipHeight = 6;
-    const shipLength = 30;
-    const wallThickness = 0.4;
-    const doorWidth = 4;
-    const doorHeight = 4;
     
     // Interior lighting
     const interiorLight = new THREE.PointLight(0xffffff, 0.8, 20);
-    interiorLight.position.set(0, shipHeight / 2, 0);
+    interiorLight.position.set(0, SHIP_HEIGHT / 2, 0);
     shipInteriorProxy.add(interiorLight);
     
     // No visual floor - physics floor is invisible
@@ -422,6 +566,7 @@
     // Interior walls (visual markers)
     const interiorWallMaterial = new THREE.MeshStandardMaterial({ 
       color: 0x666666,
+      wireframe: true, // Make ship interior wireframe for better visibility
       roughness: 0.6
     });
     
@@ -436,29 +581,35 @@
     
     // Left wall outline
     const leftWallOutline = new THREE.Mesh(
-      new THREE.BoxGeometry(wallThickness, shipHeight - wallThickness, shipLength - wallThickness),
+      new THREE.BoxGeometry(WALL_THICKNESS, SHIP_HEIGHT - WALL_THICKNESS, SHIP_LENGTH - WALL_THICKNESS),
       wallOutlineMaterial
     );
-    leftWallOutline.position.set(-shipWidth / 2 + wallThickness / 2, shipHeight / 2, 0);
+    leftWallOutline.position.set(-SHIP_WIDTH / 2 + WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0);
     shipInteriorProxy.add(leftWallOutline);
     
     // Right wall outline
     const rightWallOutline = new THREE.Mesh(
-      new THREE.BoxGeometry(wallThickness, shipHeight - wallThickness, shipLength - wallThickness),
+      new THREE.BoxGeometry(WALL_THICKNESS, SHIP_HEIGHT - WALL_THICKNESS, SHIP_LENGTH - WALL_THICKNESS),
       wallOutlineMaterial
     );
-    rightWallOutline.position.set(shipWidth / 2 - wallThickness / 2, shipHeight / 2, 0);
+    rightWallOutline.position.set(SHIP_WIDTH / 2 - WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0);
     shipInteriorProxy.add(rightWallOutline);
     
     // Back wall outline
     const backWallOutline = new THREE.Mesh(
-      new THREE.BoxGeometry(shipWidth - wallThickness, shipHeight - wallThickness, wallThickness),
+      new THREE.BoxGeometry(SHIP_WIDTH - WALL_THICKNESS, SHIP_HEIGHT - WALL_THICKNESS, WALL_THICKNESS),
       wallOutlineMaterial
     );
-    backWallOutline.position.set(0, shipHeight / 2, -shipLength / 2 + wallThickness / 2);
+    backWallOutline.position.set(0, SHIP_HEIGHT / 2, -SHIP_LENGTH / 2 + WALL_THICKNESS / 2);
     shipInteriorProxy.add(backWallOutline);
     
-    // Debug floor mesh removed - no visual floor needed, physics floor is invisible
+    // Ship interior floor mesh - matches physics collider position
+    const interiorFloorGeometry = new THREE.BoxGeometry(SHIP_WIDTH - WALL_THICKNESS * 2, WALL_THICKNESS, SHIP_LENGTH - WALL_THICKNESS * 2);
+    const interiorFloorMaterial = new THREE.MeshStandardMaterial({ color: 0x333333 });
+    const interiorFloorMesh = new THREE.Mesh(interiorFloorGeometry, interiorFloorMaterial);
+    interiorFloorMesh.position.set(0, WALL_THICKNESS / 2, 0); // Match physics collider position
+    interiorFloorMesh.receiveShadow = true;
+    shipInteriorProxy.add(interiorFloorMesh);
     
     // Create debug player capsule representation for interior scene
     const capsuleRadius = 0.5;
@@ -483,10 +634,6 @@
   
   function createDockingStation() {
     const stationGroup = new THREE.Group();
-    const wallThickness = 2.0;
-    const stationWidth = 200;
-    const stationHeight = 60;
-    const stationLength = 250;
     const dockingBayWidth = 60;
     const dockingBayHeight = 30;
     const dockingBayDepth = 80;
@@ -495,66 +642,66 @@
     
     // Main station hull - hollow box
     // Floor
-    const floorGeometry = new THREE.BoxGeometry(stationWidth, wallThickness, stationLength);
+    const floorGeometry = new THREE.BoxGeometry(STATION_WIDTH, STATION_WALL_THICKNESS, STATION_LENGTH);
     const floorMesh = new THREE.Mesh(floorGeometry, stationMaterial);
     floorMesh.castShadow = true;
     floorMesh.receiveShadow = true;
-    floorMesh.position.set(0, wallThickness / 2, 0);
+    floorMesh.position.set(0, STATION_WALL_THICKNESS / 2, 0);
     stationGroup.add(floorMesh);
     
     // Ceiling
     const ceilingMesh = new THREE.Mesh(floorGeometry, stationMaterial);
-    ceilingMesh.position.set(0, stationHeight - wallThickness / 2, 0);
+    ceilingMesh.position.set(0, STATION_HEIGHT - STATION_WALL_THICKNESS / 2, 0);
     stationGroup.add(ceilingMesh);
     
     // Walls (with docking bay opening)
     // Left wall
-    const leftWallGeometry = new THREE.BoxGeometry(wallThickness, stationHeight, stationLength);
+    const leftWallGeometry = new THREE.BoxGeometry(STATION_WALL_THICKNESS, STATION_HEIGHT, STATION_LENGTH);
     const leftWallMesh = new THREE.Mesh(leftWallGeometry, stationMaterial);
-    leftWallMesh.position.set(-stationWidth / 2 + wallThickness / 2, stationHeight / 2, 0);
+    leftWallMesh.position.set(-STATION_WIDTH / 2 + STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0);
     stationGroup.add(leftWallMesh);
     
     // Right wall
     const rightWallMesh = new THREE.Mesh(leftWallGeometry, stationMaterial);
-    rightWallMesh.position.set(stationWidth / 2 - wallThickness / 2, stationHeight / 2, 0);
+    rightWallMesh.position.set(STATION_WIDTH / 2 - STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0);
     stationGroup.add(rightWallMesh);
     
     // Back wall
-    const backWallGeometry = new THREE.BoxGeometry(stationWidth, stationHeight, wallThickness);
+    const backWallGeometry = new THREE.BoxGeometry(STATION_WIDTH, STATION_HEIGHT, STATION_WALL_THICKNESS);
     const backWallMesh = new THREE.Mesh(backWallGeometry, stationMaterial);
-    backWallMesh.position.set(0, stationHeight / 2, -stationLength / 2 + wallThickness / 2);
+    backWallMesh.position.set(0, STATION_HEIGHT / 2, -STATION_LENGTH / 2 + STATION_WALL_THICKNESS / 2);
     stationGroup.add(backWallMesh);
     
     // Front wall with docking bay opening
     const frontWallLeft = new THREE.Mesh(
-      new THREE.BoxGeometry((stationWidth - dockingBayWidth) / 2, stationHeight, wallThickness),
+      new THREE.BoxGeometry((STATION_WIDTH - dockingBayWidth) / 2, STATION_HEIGHT, STATION_WALL_THICKNESS),
       stationMaterial
     );
-    frontWallLeft.position.set(-(stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2);
+    frontWallLeft.position.set(-(STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     stationGroup.add(frontWallLeft);
     
     const frontWallRight = new THREE.Mesh(
-      new THREE.BoxGeometry((stationWidth - dockingBayWidth) / 2, stationHeight, wallThickness),
+      new THREE.BoxGeometry((STATION_WIDTH - dockingBayWidth) / 2, STATION_HEIGHT, STATION_WALL_THICKNESS),
       stationMaterial
     );
-    frontWallRight.position.set((stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2);
+    frontWallRight.position.set((STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     stationGroup.add(frontWallRight);
     
     const frontWallTop = new THREE.Mesh(
-      new THREE.BoxGeometry(dockingBayWidth, stationHeight - dockingBayHeight, wallThickness),
+      new THREE.BoxGeometry(dockingBayWidth, STATION_HEIGHT - dockingBayHeight, STATION_WALL_THICKNESS),
       stationMaterial
     );
-    frontWallTop.position.set(0, stationHeight - (stationHeight - dockingBayHeight) / 2, stationLength / 2 - wallThickness / 2);
+    frontWallTop.position.set(0, STATION_HEIGHT - (STATION_HEIGHT - dockingBayHeight) / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     stationGroup.add(frontWallTop);
     
     stationMesh = stationGroup;
-    // Position station on opposite side from ship's door (ship door faces +Z, so put station at -Z)
-    stationMesh.position.set(0, 40, -400); // Behind the ship, higher up
+    // Position station in line with ship spawn, further back (ship door faces +Z, so put station at -Z) 
+    stationMesh.position.set(0, 30, -200); // In line with ship spawn, further back
     exteriorScene.add(stationMesh);
     
-    // Create station physics body as dynamic for movement with gravity
+    // Create station physics body as dynamic with gravity and physics
     const stationBodyDesc = RAPIER.RigidBodyDesc.dynamic()
-      .setTranslation(0, 40, -400)
+      .setTranslation(0, 30, -200)
       .setCanSleep(false)
       .setLinearDamping(0.8)
       .setAngularDamping(2.0);
@@ -562,54 +709,48 @@
     
     // Station colliders - full structure for proper physics
     // Floor
-    const stationFloorCollider = RAPIER.ColliderDesc.cuboid(stationWidth / 2, wallThickness / 2, stationLength / 2)
-      .setTranslation(0, wallThickness / 2, 0);
+    const stationFloorCollider = RAPIER.ColliderDesc.cuboid(STATION_WIDTH / 2, STATION_WALL_THICKNESS / 2, STATION_LENGTH / 2)
+      .setTranslation(0, STATION_WALL_THICKNESS / 2, 0);
     exteriorWorld.createCollider(stationFloorCollider, stationBody);
     
     // Ceiling  
-    const stationCeilingCollider = RAPIER.ColliderDesc.cuboid(stationWidth / 2, wallThickness / 2, stationLength / 2)
-      .setTranslation(0, stationHeight - wallThickness / 2, 0);
+    const stationCeilingCollider = RAPIER.ColliderDesc.cuboid(STATION_WIDTH / 2, STATION_WALL_THICKNESS / 2, STATION_LENGTH / 2)
+      .setTranslation(0, STATION_HEIGHT - STATION_WALL_THICKNESS / 2, 0);
     exteriorWorld.createCollider(stationCeilingCollider, stationBody);
     
     // Left wall
-    const stationLeftWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, stationHeight / 2, stationLength / 2)
-      .setTranslation(-stationWidth / 2 + wallThickness / 2, stationHeight / 2, 0);
+    const stationLeftWallCollider = RAPIER.ColliderDesc.cuboid(STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, STATION_LENGTH / 2)
+      .setTranslation(-STATION_WIDTH / 2 + STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0);
     exteriorWorld.createCollider(stationLeftWallCollider, stationBody);
     
     // Right wall
-    const stationRightWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, stationHeight / 2, stationLength / 2)
-      .setTranslation(stationWidth / 2 - wallThickness / 2, stationHeight / 2, 0);
+    const stationRightWallCollider = RAPIER.ColliderDesc.cuboid(STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, STATION_LENGTH / 2)
+      .setTranslation(STATION_WIDTH / 2 - STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0);
     exteriorWorld.createCollider(stationRightWallCollider, stationBody);
     
     // Back wall
-    const stationBackWallCollider = RAPIER.ColliderDesc.cuboid(stationWidth / 2, stationHeight / 2, wallThickness / 2)
-      .setTranslation(0, stationHeight / 2, -stationLength / 2 + wallThickness / 2);
+    const stationBackWallCollider = RAPIER.ColliderDesc.cuboid(STATION_WIDTH / 2, STATION_HEIGHT / 2, STATION_WALL_THICKNESS / 2)
+      .setTranslation(0, STATION_HEIGHT / 2, -STATION_LENGTH / 2 + STATION_WALL_THICKNESS / 2);
     exteriorWorld.createCollider(stationBackWallCollider, stationBody);
     
     // Front walls (with docking bay opening)
-    const stationFrontLeftCollider = RAPIER.ColliderDesc.cuboid((stationWidth - dockingBayWidth) / 4, stationHeight / 2, wallThickness / 2)
-      .setTranslation(-(stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2);
+    const stationFrontLeftCollider = RAPIER.ColliderDesc.cuboid((STATION_WIDTH - dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_WALL_THICKNESS / 2)
+      .setTranslation(-(STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     exteriorWorld.createCollider(stationFrontLeftCollider, stationBody);
     
-    const stationFrontRightCollider = RAPIER.ColliderDesc.cuboid((stationWidth - dockingBayWidth) / 4, stationHeight / 2, wallThickness / 2)
-      .setTranslation((stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2);
+    const stationFrontRightCollider = RAPIER.ColliderDesc.cuboid((STATION_WIDTH - dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_WALL_THICKNESS / 2)
+      .setTranslation((STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     exteriorWorld.createCollider(stationFrontRightCollider, stationBody);
     
-    const stationFrontTopCollider = RAPIER.ColliderDesc.cuboid(dockingBayWidth / 2, (stationHeight - dockingBayHeight) / 2, wallThickness / 2)
-      .setTranslation(0, stationHeight - (stationHeight - dockingBayHeight) / 2, stationLength / 2 - wallThickness / 2);
+    const stationFrontTopCollider = RAPIER.ColliderDesc.cuboid(dockingBayWidth / 2, (STATION_HEIGHT - dockingBayHeight) / 2, STATION_WALL_THICKNESS / 2)
+      .setTranslation(0, STATION_HEIGHT - (STATION_HEIGHT - dockingBayHeight) / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     exteriorWorld.createCollider(stationFrontTopCollider, stationBody);
     
-    // Create ship docking sensor just inside the docking bay entrance
-    const dockingSensorCollider = RAPIER.ColliderDesc.cuboid(dockingBayWidth / 2 - 1, dockingBayHeight / 2 - 1, 5)
-      .setTranslation(0, dockingBayHeight / 2, stationLength / 2 - 10)
-      .setSensor(true)
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
-    exteriorWorld.createCollider(dockingSensorCollider, stationBody);
     
     
-    // Create player entry sensor for direct station access
-    const stationEntrySensorCollider = RAPIER.ColliderDesc.cuboid(3, 3, 0.5)
-      .setTranslation(-10, 3, stationLength / 2 - wallThickness / 2)
+    // Create player entry sensor for direct station access - small sensor just inside docking bay
+    const stationEntrySensorCollider = RAPIER.ColliderDesc.cuboid(dockingBayWidth / 2 - 2.0, dockingBayHeight / 2 - 2.0, 1.0)
+      .setTranslation(0, dockingBayHeight / 2, STATION_LENGTH / 2 - 2.0)
       .setSensor(true)
       .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     exteriorWorld.createCollider(stationEntrySensorCollider, stationBody);
@@ -617,61 +758,60 @@
     createStationInterior();
   }
   
-  let stationShipProxy; // Ship representation in station interior
+  // Ship visual proxies now handled in stationShipProxies array
 
   function createStationInterior() {
     stationInteriorProxy = new THREE.Group();
     
-    const stationWidth = 200;
-    const stationHeight = 60;
-    const stationLength = 250;
-    const wallThickness = 2.0;
     
     // Station interior lighting
     const stationInteriorLight = new THREE.PointLight(0xffffff, 1.2, 150);
-    stationInteriorLight.position.set(0, stationHeight / 2, 0);
+    stationInteriorLight.position.set(0, STATION_HEIGHT / 2, 0);
     stationInteriorProxy.add(stationInteriorLight);
     
     // Add additional lights for better visibility
     const frontLight = new THREE.PointLight(0xffffff, 0.8, 100);
-    frontLight.position.set(0, stationHeight / 2, stationLength / 3);
+    frontLight.position.set(0, STATION_HEIGHT / 2, STATION_LENGTH / 3);
     stationInteriorProxy.add(frontLight);
     
     const backLight = new THREE.PointLight(0xffffff, 0.8, 100);
-    backLight.position.set(0, stationHeight / 2, -stationLength / 3);
+    backLight.position.set(0, STATION_HEIGHT / 2, -STATION_LENGTH / 3);
     stationInteriorProxy.add(backLight);
     
     // Create visual walls for station interior
-    const interiorWallMaterial = new THREE.MeshStandardMaterial({ color: 0x666666 });
+    const interiorWallMaterial = new THREE.MeshStandardMaterial({ 
+      color: 0x666666, 
+      wireframe: true // Make station interior wireframe for better visibility
+    });
     
     // Floor
-    const floorGeometry = new THREE.BoxGeometry(stationWidth - wallThickness, wallThickness, stationLength - wallThickness);
+    const floorGeometry = new THREE.BoxGeometry(STATION_WIDTH - STATION_WALL_THICKNESS, STATION_WALL_THICKNESS, STATION_LENGTH - STATION_WALL_THICKNESS);
     const floorMesh = new THREE.Mesh(floorGeometry, interiorWallMaterial);
-    floorMesh.position.y = wallThickness / 2;
+    floorMesh.position.y = STATION_WALL_THICKNESS / 2;
     stationInteriorProxy.add(floorMesh);
     
     // Ceiling (partial to show it's a hangar)
-    const ceilingGeometry = new THREE.BoxGeometry(stationWidth - wallThickness, wallThickness, stationLength - wallThickness);
+    const ceilingGeometry = new THREE.BoxGeometry(STATION_WIDTH - STATION_WALL_THICKNESS, STATION_WALL_THICKNESS, STATION_LENGTH - STATION_WALL_THICKNESS);
     const ceilingMesh = new THREE.Mesh(ceilingGeometry, interiorWallMaterial);
-    ceilingMesh.position.y = stationHeight - wallThickness / 2;
+    ceilingMesh.position.y = STATION_HEIGHT - STATION_WALL_THICKNESS / 2;
     stationInteriorProxy.add(ceilingMesh);
     
     // Left wall
-    const leftWallGeometry = new THREE.BoxGeometry(wallThickness, stationHeight, stationLength);
+    const leftWallGeometry = new THREE.BoxGeometry(STATION_WALL_THICKNESS, STATION_HEIGHT, STATION_LENGTH);
     const leftWallMesh = new THREE.Mesh(leftWallGeometry, interiorWallMaterial);
-    leftWallMesh.position.set(-stationWidth / 2 + wallThickness / 2, stationHeight / 2, 0);
+    leftWallMesh.position.set(-STATION_WIDTH / 2 + STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0);
     stationInteriorProxy.add(leftWallMesh);
     
     // Right wall
-    const rightWallGeometry = new THREE.BoxGeometry(wallThickness, stationHeight, stationLength);
+    const rightWallGeometry = new THREE.BoxGeometry(STATION_WALL_THICKNESS, STATION_HEIGHT, STATION_LENGTH);
     const rightWallMesh = new THREE.Mesh(rightWallGeometry, interiorWallMaterial);
-    rightWallMesh.position.set(stationWidth / 2 - wallThickness / 2, stationHeight / 2, 0);
+    rightWallMesh.position.set(STATION_WIDTH / 2 - STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0);
     stationInteriorProxy.add(rightWallMesh);
     
     // Back wall
-    const backWallGeometry = new THREE.BoxGeometry(stationWidth, stationHeight, wallThickness);
+    const backWallGeometry = new THREE.BoxGeometry(STATION_WIDTH, STATION_HEIGHT, STATION_WALL_THICKNESS);
     const backWallMesh = new THREE.Mesh(backWallGeometry, interiorWallMaterial);
-    backWallMesh.position.set(0, stationHeight / 2, -stationLength / 2 + wallThickness / 2);
+    backWallMesh.position.set(0, STATION_HEIGHT / 2, -STATION_LENGTH / 2 + STATION_WALL_THICKNESS / 2);
     stationInteriorProxy.add(backWallMesh);
     
     // Front wall with docking bay opening (partial walls around opening)
@@ -680,24 +820,24 @@
     
     // Front wall sections around docking bay
     const frontWallLeft = new THREE.Mesh(
-      new THREE.BoxGeometry((stationWidth - dockingBayWidth) / 2, stationHeight, wallThickness),
+      new THREE.BoxGeometry((STATION_WIDTH - dockingBayWidth) / 2, STATION_HEIGHT, STATION_WALL_THICKNESS),
       interiorWallMaterial
     );
-    frontWallLeft.position.set(-(stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2);
+    frontWallLeft.position.set(-(STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     stationInteriorProxy.add(frontWallLeft);
     
     const frontWallRight = new THREE.Mesh(
-      new THREE.BoxGeometry((stationWidth - dockingBayWidth) / 2, stationHeight, wallThickness),
+      new THREE.BoxGeometry((STATION_WIDTH - dockingBayWidth) / 2, STATION_HEIGHT, STATION_WALL_THICKNESS),
       interiorWallMaterial
     );
-    frontWallRight.position.set((stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2);
+    frontWallRight.position.set((STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     stationInteriorProxy.add(frontWallRight);
     
     const frontWallTop = new THREE.Mesh(
-      new THREE.BoxGeometry(dockingBayWidth, stationHeight - dockingBayHeight, wallThickness),
+      new THREE.BoxGeometry(dockingBayWidth, STATION_HEIGHT - dockingBayHeight, STATION_WALL_THICKNESS),
       interiorWallMaterial
     );
-    frontWallTop.position.set(0, stationHeight - (stationHeight - dockingBayHeight) / 2, stationLength / 2 - wallThickness / 2);
+    frontWallTop.position.set(0, STATION_HEIGHT - (STATION_HEIGHT - dockingBayHeight) / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2);
     stationInteriorProxy.add(frontWallTop);
     
     
@@ -719,68 +859,86 @@
     stationScene.add(debugStationPlayerMesh);
     
     // Create station interior physics
-    createStationPhysics(stationWidth, stationHeight, stationLength, wallThickness);
+    createStationPhysics(STATION_WIDTH, STATION_HEIGHT, STATION_LENGTH, STATION_WALL_THICKNESS);
     
     stationInteriorProxy.visible = false;
     stationScene.add(stationInteriorProxy);
   }
   
-  function createStationPhysics(stationWidth, stationHeight, stationLength, wallThickness) {
+  function createStationPhysics(STATION_WIDTH, STATION_HEIGHT, STATION_LENGTH, WALL_THICKNESS) {
     // Station interior floor
     const stationFloorBody = stationWorld.createRigidBody(
-      RAPIER.RigidBodyDesc.fixed().setTranslation(0, wallThickness / 2, 0)
+      RAPIER.RigidBodyDesc.fixed().setTranslation(0, STATION_WALL_THICKNESS / 2, 0)
     );
     const stationFloorCollider = RAPIER.ColliderDesc.cuboid(
-      stationWidth / 2 - wallThickness, 
-      wallThickness / 2, 
-      stationLength / 2 - wallThickness
-    );
+      STATION_WIDTH / 2, 
+      STATION_WALL_THICKNESS / 2, 
+      STATION_LENGTH / 2
+    ).setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     stationWorld.createCollider(stationFloorCollider, stationFloorBody);
     
     // Station interior walls
-    const stationLeftWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-stationWidth / 2 + wallThickness / 2, stationHeight / 2, 0));
-    const stationLeftWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, stationHeight / 2, stationLength / 2);
+    const stationLeftWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-STATION_WIDTH / 2 + STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0));
+    const stationLeftWallCollider = RAPIER.ColliderDesc.cuboid(STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, STATION_LENGTH / 2);
     stationWorld.createCollider(stationLeftWallCollider, stationLeftWallBody);
     
-    const stationRightWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(stationWidth / 2 - wallThickness / 2, stationHeight / 2, 0));
-    const stationRightWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, stationHeight / 2, stationLength / 2);
+    const stationRightWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(STATION_WIDTH / 2 - STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, 0));
+    const stationRightWallCollider = RAPIER.ColliderDesc.cuboid(STATION_WALL_THICKNESS / 2, STATION_HEIGHT / 2, STATION_LENGTH / 2);
     stationWorld.createCollider(stationRightWallCollider, stationRightWallBody);
     
     // Station interior back wall
-    const stationBackWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, stationHeight / 2, -stationLength / 2 + wallThickness / 2));
-    const stationBackWallCollider = RAPIER.ColliderDesc.cuboid(stationWidth / 2, stationHeight / 2, wallThickness / 2);
+    const stationBackWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, STATION_HEIGHT / 2, -STATION_LENGTH / 2 + STATION_WALL_THICKNESS / 2));
+    const stationBackWallCollider = RAPIER.ColliderDesc.cuboid(STATION_WIDTH / 2, STATION_HEIGHT / 2, STATION_WALL_THICKNESS / 2);
     stationWorld.createCollider(stationBackWallCollider, stationBackWallBody);
     
     // Station interior front walls (with docking bay opening)
     const dockingBayWidth = 60, dockingBayHeight = 30;
     
     // Front left wall section
-    const stationFrontLeftWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-(stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2));
-    const stationFrontLeftWallCollider = RAPIER.ColliderDesc.cuboid((stationWidth - dockingBayWidth) / 4, stationHeight / 2, wallThickness / 2);
+    const stationFrontLeftWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(-(STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2));
+    const stationFrontLeftWallCollider = RAPIER.ColliderDesc.cuboid((STATION_WIDTH - dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_WALL_THICKNESS / 2);
     stationWorld.createCollider(stationFrontLeftWallCollider, stationFrontLeftWallBody);
     
     // Front right wall section
-    const stationFrontRightWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation((stationWidth + dockingBayWidth) / 4, stationHeight / 2, stationLength / 2 - wallThickness / 2));
-    const stationFrontRightWallCollider = RAPIER.ColliderDesc.cuboid((stationWidth - dockingBayWidth) / 4, stationHeight / 2, wallThickness / 2);
+    const stationFrontRightWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation((STATION_WIDTH + dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2));
+    const stationFrontRightWallCollider = RAPIER.ColliderDesc.cuboid((STATION_WIDTH - dockingBayWidth) / 4, STATION_HEIGHT / 2, STATION_WALL_THICKNESS / 2);
     stationWorld.createCollider(stationFrontRightWallCollider, stationFrontRightWallBody);
     
     // Front top wall section (above docking bay opening)
-    const stationFrontTopWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, stationHeight - (stationHeight - dockingBayHeight) / 2, stationLength / 2 - wallThickness / 2));
-    const stationFrontTopWallCollider = RAPIER.ColliderDesc.cuboid(dockingBayWidth / 2, (stationHeight - dockingBayHeight) / 2, wallThickness / 2);
+    const stationFrontTopWallBody = stationWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, STATION_HEIGHT - (STATION_HEIGHT - dockingBayHeight) / 2, STATION_LENGTH / 2 - STATION_WALL_THICKNESS / 2));
+    const stationFrontTopWallCollider = RAPIER.ColliderDesc.cuboid(dockingBayWidth / 2, (STATION_HEIGHT - dockingBayHeight) / 2, STATION_WALL_THICKNESS / 2);
     stationWorld.createCollider(stationFrontTopWallCollider, stationFrontTopWallBody);
     
     // Station interior ceiling
     const stationCeilingBody = stationWorld.createRigidBody(
-      RAPIER.RigidBodyDesc.fixed().setTranslation(0, stationHeight - wallThickness / 2, 0)
+      RAPIER.RigidBodyDesc.fixed().setTranslation(0, STATION_HEIGHT - STATION_WALL_THICKNESS / 2, 0)
     );
     const stationCeilingCollider = RAPIER.ColliderDesc.cuboid(
-      stationWidth / 2 - wallThickness, 
-      wallThickness / 2, 
-      stationLength / 2 - wallThickness
+      STATION_WIDTH / 2, 
+      STATION_WALL_THICKNESS / 2, 
+      STATION_LENGTH / 2
     );
     stationWorld.createCollider(stationCeilingCollider, stationCeilingBody);
     
     console.log('Created station interior physics');
+    
+    // Create first ship physics body in station world (initially inactive)
+    // This creates space for the first ship - more ships will be added when they dock
+    createStationShip(0); // Create ship at index 0
+    
+    // Initialize compatibility variables to point to the first ship
+    stationShipBody = stationShipBodies[0];
+    stationShipProxy = stationShipProxies[0];
+  }
+  
+  // Creates a ship physics body and visual proxy for the station at the given index
+  function createStationShip(shipIndex) {
+    // Calculate ship position within station (spread ships out to prevent overlap)
+    const shipSpacing = 50; // Space between ships in Z direction
+    const baseZ = -50; // Base Z position for first ship
+    const shipZ = baseZ - (shipIndex * shipSpacing);
+    
+    console.log(`Creating station ship ${shipIndex} at Z=${shipZ}`);
     
     // Create ship physics body in station world (initially inactive)
     const stationShipBodyDesc = RAPIER.RigidBodyDesc.dynamic()
@@ -788,133 +946,188 @@
       .setCanSleep(false)
       .setLinearDamping(0.5)
       .setAngularDamping(2.0);
-    stationShipBody = stationWorld.createRigidBody(stationShipBodyDesc);
+    const stationShipBody = stationWorld.createRigidBody(stationShipBodyDesc);
     
     // Create compound ship colliders in station world (same as exterior with door opening)
-    const shipWidth = 20, shipHeight = 6, shipLength = 30;
-    const doorWidth = 4, doorHeight = 4;
-    
     // Ship floor in station (positioned to align with station floor for seamless walking)
-    const shipFloorInStationCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, wallThickness / 2, shipLength / 2)
-      .setTranslation(0, -wallThickness, 0); // Position ship floor 1 unit below ship body to align with station floor
+    const shipFloorInStationCollider = RAPIER.ColliderDesc.cuboid(SHIP_WIDTH / 2, WALL_THICKNESS / 2, SHIP_LENGTH / 2)
+      .setTranslation(0, WALL_THICKNESS / 2, 0) // Match exterior world ship floor position
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS); // Enable collision events for debugging
     stationWorld.createCollider(shipFloorInStationCollider, stationShipBody);
     
-    // Ship ceiling in station  
-    const shipCeilingInStationCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, wallThickness / 2, shipLength / 2)
-      .setTranslation(0, shipHeight - wallThickness, 0); // Adjusted for floor offset
+    // Ship ceiling in station (match exterior world positioning)
+    const shipCeilingInStationCollider = RAPIER.ColliderDesc.cuboid(SHIP_WIDTH / 2, WALL_THICKNESS / 2, SHIP_LENGTH / 2)
+      .setTranslation(0, SHIP_HEIGHT - WALL_THICKNESS / 2, 0); // Match exterior world ceiling position
     stationWorld.createCollider(shipCeilingInStationCollider, stationShipBody);
     
-    // Ship left wall in station
-    const shipLeftWallInStationCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2)
-      .setTranslation(-shipWidth / 2 + wallThickness / 2, shipHeight / 2 - wallThickness, 0); // Adjusted for floor offset
+    // Ship left wall in station (match exterior world positioning)
+    const shipLeftWallInStationCollider = RAPIER.ColliderDesc.cuboid(WALL_THICKNESS / 2, SHIP_HEIGHT / 2, SHIP_LENGTH / 2)
+      .setTranslation(-SHIP_WIDTH / 2 + WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0); // Match exterior world wall position
     stationWorld.createCollider(shipLeftWallInStationCollider, stationShipBody);
     
-    // Ship right wall in station  
-    const shipRightWallInStationCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2)
-      .setTranslation(shipWidth / 2 - wallThickness / 2, shipHeight / 2 - wallThickness, 0); // Adjusted for floor offset
+    // Ship right wall in station (match exterior world positioning)  
+    const shipRightWallInStationCollider = RAPIER.ColliderDesc.cuboid(WALL_THICKNESS / 2, SHIP_HEIGHT / 2, SHIP_LENGTH / 2)
+      .setTranslation(SHIP_WIDTH / 2 - WALL_THICKNESS / 2, SHIP_HEIGHT / 2, 0); // Match exterior world wall position
     stationWorld.createCollider(shipRightWallInStationCollider, stationShipBody);
     
-    // Ship back wall in station
-    const shipBackWallInStationCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, shipHeight / 2, wallThickness / 2)
-      .setTranslation(0, shipHeight / 2 - wallThickness, -shipLength / 2 + wallThickness / 2); // Adjusted for floor offset
+    // Ship back wall in station (match exterior world positioning)
+    const shipBackWallInStationCollider = RAPIER.ColliderDesc.cuboid(SHIP_WIDTH / 2, SHIP_HEIGHT / 2, WALL_THICKNESS / 2)
+      .setTranslation(0, SHIP_HEIGHT / 2, -SHIP_LENGTH / 2 + WALL_THICKNESS / 2); // Match exterior world back wall position
     stationWorld.createCollider(shipBackWallInStationCollider, stationShipBody);
     
-    // Ship front wall colliders in station (with door opening)
-    const shipFrontWallLeftInStationCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2)
-      .setTranslation(-(shipWidth + doorWidth) / 4, shipHeight / 2 - wallThickness, shipLength / 2 - wallThickness / 2); // Adjusted for floor offset
+    // Ship front wall colliders in station (with door opening, match exterior world positioning)
+    const shipFrontWallLeftInStationCollider = RAPIER.ColliderDesc.cuboid((SHIP_WIDTH - DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, WALL_THICKNESS / 2)
+      .setTranslation(-(SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2); // Match exterior world front wall position
     stationWorld.createCollider(shipFrontWallLeftInStationCollider, stationShipBody);
     
-    const shipFrontWallRightInStationCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2)
-      .setTranslation((shipWidth + doorWidth) / 4, shipHeight / 2 - wallThickness, shipLength / 2 - wallThickness / 2); // Adjusted for floor offset
+    const shipFrontWallRightInStationCollider = RAPIER.ColliderDesc.cuboid((SHIP_WIDTH - DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, WALL_THICKNESS / 2)
+      .setTranslation((SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2); // Match exterior world front wall position
     stationWorld.createCollider(shipFrontWallRightInStationCollider, stationShipBody);
     
-    const shipFrontWallTopInStationCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2, (shipHeight - doorHeight) / 2, wallThickness / 2)
-      .setTranslation(0, shipHeight - (shipHeight - doorHeight) / 2 - wallThickness, shipLength / 2 - wallThickness / 2); // Adjusted for floor offset
+    const shipFrontWallTopInStationCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2, (SHIP_HEIGHT - DOOR_HEIGHT) / 2, WALL_THICKNESS / 2)
+      .setTranslation(0, SHIP_HEIGHT - (SHIP_HEIGHT - DOOR_HEIGHT) / 2, SHIP_LENGTH / 2 - WALL_THICKNESS / 2); // Match exterior world front wall top position
     stationWorld.createCollider(shipFrontWallTopInStationCollider, stationShipBody);
     
-    // Note: Door sensor removed - using position-based detection instead
+    // Create ship entry sensor for station world - allows player to enter ship from station
+    const shipStationEntrySensorCollider = RAPIER.ColliderDesc.cuboid(DOOR_WIDTH / 2 - 0.2, DOOR_HEIGHT / 2 - 0.2, 0.3)
+      .setTranslation(0, DOOR_HEIGHT / 2, SHIP_LENGTH / 2 - WALL_THICKNESS - 0.5)
+      .setSensor(true)
+      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
+    stationWorld.createCollider(shipStationEntrySensorCollider, stationShipBody);
+    
+    // Store ship body in array
+    stationShipBodies[shipIndex] = stationShipBody;
+    
+    // Create visual proxy for this ship
+    createStationShipProxy(shipIndex);
+    
+    // Initialize compatibility layer for the first ship
+    if (shipIndex === 0) {
+      updateActiveShip(0);
+    }
+    
+    return stationShipBody;
   }
   
-  function createStationShipProxy() {
+  function createStationShipProxy(shipIndex = 0) {
     // Create a copy of the ship for display in the station interior
     const shipGroup = new THREE.Group();
-    const wallThickness = 0.4;
-    const shipWidth = 20;
-    const shipHeight = 6;
-    const shipLength = 30;
     
     const hullMaterial = new THREE.MeshStandardMaterial({ color: 0x444444 });
     
     // Floor (matched exactly to physics collider position)
-    const floorGeometry = new THREE.BoxGeometry(shipWidth, wallThickness, shipLength);
+    const floorGeometry = new THREE.BoxGeometry(SHIP_WIDTH, WALL_THICKNESS, SHIP_LENGTH);
     const floorMesh = new THREE.Mesh(floorGeometry, hullMaterial);
     floorMesh.castShadow = true;
     floorMesh.receiveShadow = true;
-    // Physics collider is at Y=-wallThickness, visual mesh center matches
-    floorMesh.position.set(0, -wallThickness, 0); 
+    // Physics collider is at Y=-WALL_THICKNESS to align with station floor, visual mesh center matches
+    floorMesh.position.set(0, -WALL_THICKNESS, 0); 
     shipGroup.add(floorMesh);
     
     // Ceiling (matched exactly to physics collider position)  
-    const ceilingGeometry = new THREE.BoxGeometry(shipWidth, wallThickness, shipLength);
+    const ceilingGeometry = new THREE.BoxGeometry(SHIP_WIDTH, WALL_THICKNESS, SHIP_LENGTH);
     const ceilingMesh = new THREE.Mesh(ceilingGeometry, hullMaterial);
-    // Physics collider is at Y=shipHeight-wallThickness, visual mesh center matches
-    ceilingMesh.position.set(0, shipHeight - wallThickness, 0);
+    // Physics collider is at Y=SHIP_HEIGHT-WALL_THICKNESS, visual mesh center matches
+    ceilingMesh.position.set(0, SHIP_HEIGHT - WALL_THICKNESS, 0);
     shipGroup.add(ceilingMesh);
     
     // Left wall (matched exactly to physics collider position)
-    const leftWallGeometry = new THREE.BoxGeometry(wallThickness, shipHeight, shipLength);
+    const leftWallGeometry = new THREE.BoxGeometry(WALL_THICKNESS, SHIP_HEIGHT, SHIP_LENGTH);
     const leftWallMesh = new THREE.Mesh(leftWallGeometry, hullMaterial);
-    // Physics collider is at Y=shipHeight/2-wallThickness, visual mesh center matches
-    leftWallMesh.position.set(-shipWidth / 2 + wallThickness / 2, shipHeight / 2 - wallThickness, 0);
+    // Physics collider is at Y=SHIP_HEIGHT/2-WALL_THICKNESS, visual mesh center matches
+    leftWallMesh.position.set(-SHIP_WIDTH / 2 + WALL_THICKNESS / 2, SHIP_HEIGHT / 2 - WALL_THICKNESS, 0);
     shipGroup.add(leftWallMesh);
     
     // Right wall (matched exactly to physics collider position)
     const rightWallMesh = new THREE.Mesh(leftWallGeometry, hullMaterial);
-    rightWallMesh.position.set(shipWidth / 2 - wallThickness / 2, shipHeight / 2 - wallThickness, 0);
+    rightWallMesh.position.set(SHIP_WIDTH / 2 - WALL_THICKNESS / 2, SHIP_HEIGHT / 2 - WALL_THICKNESS, 0);
     shipGroup.add(rightWallMesh);
     
     // Back wall (matched exactly to physics collider position)
-    const backWallGeometry = new THREE.BoxGeometry(shipWidth, shipHeight, wallThickness);
+    const backWallGeometry = new THREE.BoxGeometry(SHIP_WIDTH, SHIP_HEIGHT, WALL_THICKNESS);
     const backWallMesh = new THREE.Mesh(backWallGeometry, hullMaterial);
-    backWallMesh.position.set(0, shipHeight / 2 - wallThickness, -shipLength / 2 + wallThickness / 2);
+    backWallMesh.position.set(0, SHIP_HEIGHT / 2 - WALL_THICKNESS, -SHIP_LENGTH / 2 + WALL_THICKNESS / 2);
     shipGroup.add(backWallMesh);
     
     // Front wall with door opening (adjusted for floor at Y=0)
-    const doorWidth = 4;  
-    const doorHeight = 4;
+    const DOOR_WIDTH = 4;  
+    const DOOR_HEIGHT = 4;
     
     const frontWallLeft = new THREE.Mesh(
-      new THREE.BoxGeometry((shipWidth - doorWidth) / 2, shipHeight, wallThickness),
+      new THREE.BoxGeometry((SHIP_WIDTH - DOOR_WIDTH) / 2, SHIP_HEIGHT, WALL_THICKNESS),
       hullMaterial
     );
-    frontWallLeft.position.set(-(shipWidth + doorWidth) / 4, shipHeight / 2 - wallThickness, shipLength / 2 - wallThickness / 2);
+    frontWallLeft.position.set(-(SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2 - WALL_THICKNESS, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
     shipGroup.add(frontWallLeft);
     
     const frontWallRight = new THREE.Mesh(
-      new THREE.BoxGeometry((shipWidth - doorWidth) / 2, shipHeight, wallThickness),
+      new THREE.BoxGeometry((SHIP_WIDTH - DOOR_WIDTH) / 2, SHIP_HEIGHT, WALL_THICKNESS),
       hullMaterial
     );
-    frontWallRight.position.set((shipWidth + doorWidth) / 4, shipHeight / 2 - wallThickness, shipLength / 2 - wallThickness / 2);
+    frontWallRight.position.set((SHIP_WIDTH + DOOR_WIDTH) / 4, SHIP_HEIGHT / 2 - WALL_THICKNESS, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
     shipGroup.add(frontWallRight);
     
     const frontWallTop = new THREE.Mesh(
-      new THREE.BoxGeometry(doorWidth, shipHeight - doorHeight, wallThickness),
+      new THREE.BoxGeometry(DOOR_WIDTH, SHIP_HEIGHT - DOOR_HEIGHT, WALL_THICKNESS),
       hullMaterial
     );
     // Matched exactly to physics collider position  
-    frontWallTop.position.set(0, shipHeight - (shipHeight - doorHeight) / 2 - wallThickness, shipLength / 2 - wallThickness / 2);
+    frontWallTop.position.set(0, SHIP_HEIGHT - (SHIP_HEIGHT - DOOR_HEIGHT) / 2 - WALL_THICKNESS, SHIP_LENGTH / 2 - WALL_THICKNESS / 2);
     shipGroup.add(frontWallTop);
     
     // Deck on top
-    const deckGeometry = new THREE.BoxGeometry(shipWidth - 1, wallThickness, shipLength - 2);
+    const deckGeometry = new THREE.BoxGeometry(SHIP_WIDTH - 1, WALL_THICKNESS, SHIP_LENGTH - 2);
     const deckMaterial = new THREE.MeshStandardMaterial({ color: 0x8B4513 });
     const deckMesh = new THREE.Mesh(deckGeometry, deckMaterial);
-    deckMesh.position.y = shipHeight + wallThickness / 2;
+    deckMesh.position.y = SHIP_HEIGHT + WALL_THICKNESS / 2;
     shipGroup.add(deckMesh);
     
-    stationShipProxy = shipGroup;
-    stationShipProxy.visible = false; // Hidden until ship docks
-    stationScene.add(stationShipProxy);
+    // Store ship proxy in array
+    stationShipProxies[shipIndex] = shipGroup;
+    shipGroup.visible = false; // Hidden until ship docks
+    stationScene.add(shipGroup);
+    
+    console.log(`Created station ship proxy ${shipIndex}`);
+  }
+  
+  // Helper functions for multi-ship system
+  function getActiveStationShip() {
+    return stationShipBodies[activeShipIndex];
+  }
+  
+  function getActiveStationShipProxy() {
+    return stationShipProxies[activeShipIndex];
+  }
+  
+  function findClosestStationShip(playerPos) {
+    // Find the closest ship to the player in the station
+    let closestIndex = 0;
+    let closestDistance = Infinity;
+    
+    for (let i = 0; i < stationShipBodies.length; i++) {
+      if (stationShipBodies[i]) {
+        const shipPos = stationShipBodies[i].translation();
+        const distance = Math.sqrt(
+          Math.pow(playerPos.x - shipPos.x, 2) + 
+          Math.pow(playerPos.y - shipPos.y, 2) + 
+          Math.pow(playerPos.z - shipPos.z, 2)
+        );
+        if (distance < closestDistance) {
+          closestDistance = distance;
+          closestIndex = i;
+        }
+      }
+    }
+    
+    return closestIndex;
+  }
+  
+  function updateActiveShip(newActiveIndex) {
+    activeShipIndex = newActiveIndex;
+    // Update compatibility layer
+    stationShipBody = stationShipBodies[activeShipIndex];
+    stationShipProxy = stationShipProxies[activeShipIndex];
+    console.log(`Active ship changed to index ${activeShipIndex}`);
   }
   
   function handleKeyDown(event) {
@@ -1176,7 +1389,6 @@
     // Switch to new kinematic body
     playerBody = newKinematicBody;
     playerCollider = newCollider;
-    isInsideShip = true;
     
     // Set interior player to the natural relative position
     interiorPlayerBody.setTranslation({ 
@@ -1200,19 +1412,34 @@
 
   function enterShip() {
     console.log('Seamlessly entering ship - switching to interior physics control');
-    isInsideShip = true;
+    
+    // Update proxy context first
+    enterShipFromExteriorContext(interiorPlayerBody);
+    
+    // Reset camera to consistent angle when entering ship
+    cameraRotation.yaw = 0;
+    cameraRotation.pitch = 0;
     
     // Get current exterior player state
     const currentExteriorPos = playerBody.translation();
     const currentExteriorVel = playerBody.linvel();
     const shipPos = shipBody.translation();
+    const shipRot = shipBody.rotation();
     
-    // Calculate relative position inside ship (exterior pos - ship pos)
-    const relativeX = currentExteriorPos.x - shipPos.x;
-    const relativeY = currentExteriorPos.y - shipPos.y;
-    const relativeZ = currentExteriorPos.z - shipPos.z;
+    // Get ship rotation as quaternion
+    const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
     
-    console.log('Switching control - relative position:', { relativeX, relativeY, relativeZ });
+    // Calculate player position relative to ship
+    const relativePos = new THREE.Vector3(
+      currentExteriorPos.x - shipPos.x,
+      currentExteriorPos.y - shipPos.y,
+      currentExteriorPos.z - shipPos.z
+    );
+    
+    // Apply inverse ship rotation to get ship-local position
+    relativePos.applyQuaternion(shipQuat.clone().invert());
+    
+    console.log('Switching control - relative position (rotation-corrected):', relativePos);
     
     // Convert exterior player to kinematic (synchronized by interior simulation)
     if (playerCollider) {
@@ -1233,11 +1460,15 @@
     playerCollider = exteriorWorld.createCollider(kinematicPlayerColliderDesc, playerBody);
     
     // Set interior player to relative position and maintain velocity
-    interiorPlayerBody.setTranslation({ x: relativeX, y: relativeY, z: relativeZ }, true);
+    interiorPlayerBody.setTranslation({ 
+      x: relativePos.x, 
+      y: relativePos.y, 
+      z: relativePos.z 
+    }, true);
     interiorPlayerBody.setLinvel({ x: currentExteriorVel.x, y: currentExteriorVel.y, z: currentExteriorVel.z }, true);
     
     console.log('Interior player taking control at:', interiorPlayerBody.translation());
-    console.log('Expected relative position should be:', { relativeX, relativeY, relativeZ });
+    console.log('Expected relative position should be:', relativePos);
     console.log('Ship position was:', shipPos);
     console.log('Exterior position was:', currentExteriorPos);
     
@@ -1257,15 +1488,29 @@
     // Immediately position interior player body at correct location to avoid glitch
     const currentExteriorPos = playerBody.translation();
     const shipPos = shipBody.translation();
+    const shipRot = shipBody.rotation();
     
-    const relativeX = currentExteriorPos.x - shipPos.x;
-    const relativeY = currentExteriorPos.y - shipPos.y;
-    const relativeZ = currentExteriorPos.z - shipPos.z;
+    // Get ship rotation as quaternion
+    const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
     
-    console.log('Pre-positioning interior player at relative:', { relativeX, relativeY, relativeZ });
+    // Calculate player position relative to ship
+    const relativePos = new THREE.Vector3(
+      currentExteriorPos.x - shipPos.x,
+      currentExteriorPos.y - shipPos.y,
+      currentExteriorPos.z - shipPos.z
+    );
+    
+    // Apply inverse ship rotation to get ship-local position
+    relativePos.applyQuaternion(shipQuat.clone().invert());
+    
+    console.log('Pre-positioning interior player at relative (rotation-corrected):', relativePos);
     
     // Set interior player to correct position immediately
-    interiorPlayerBody.setTranslation({ x: relativeX, y: relativeY, z: relativeZ }, true);
+    interiorPlayerBody.setTranslation({ 
+      x: relativePos.x, 
+      y: relativePos.y, 
+      z: relativePos.z 
+    }, true);
     interiorPlayerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
   }
   
@@ -1316,14 +1561,13 @@
   }
 
   function checkStationAutoExit() {
-    // Prevent multiple exit calls
-    if (isExiting || !isInsideStation) return;
+    // Prevent multiple exit calls - check proxy context
+    if (isExiting || playerProxyContext.activeWorld !== 'station') return;
     
     const stationPos = stationPlayerBody.translation();
     const stationVel = stationPlayerBody.linvel();
-    const stationLength = 250;
-    const wallThickness = 2.0;
-    const dockingBayOpeningZ = stationLength / 2 - wallThickness / 2; // Front opening position
+    // Use global constants
+    const dockingBayOpeningZ = STATION_LENGTH / 2 - WALL_THICKNESS / 2; // Front opening position
     
     // More restrictive exit detection - player must be clearly exiting through docking bay
     const wellBeyondOpening = stationPos.z > dockingBayOpeningZ + 2; // Must be 2 units past the opening
@@ -1343,13 +1587,13 @@
   }
 
   function checkAutoExit() {
-    // Prevent multiple exit calls
-    if (isExiting || !isInsideShip) return;
+    // Prevent multiple exit calls - check proxy context instead of legacy flag
+    if (isExiting || playerProxyContext.activeWorld !== 'ship') return;
     
     const interiorPos = interiorPlayerBody.translation();
     const interiorVel = interiorPlayerBody.linvel();
-    const shipLength = 30;
-    const doorZ = shipLength / 2 - 0.4; // Front door position (14.6)
+    // Use global constants
+    const doorZ = SHIP_LENGTH / 2 - 0.4; // Front door position (14.6)
     
     // More restrictive exit detection - player must be clearly exiting
     const wellBeyondDoor = interiorPos.z > doorZ + 1; // Must be 1 unit past the door
@@ -1375,6 +1619,13 @@
   }
   
   function immediateExitToExterior() {
+    // Safety check - never allow exterior exit if player was in a docked ship
+    if (isShipDocked || playerProxyContext.hierarchy.includes('station')) {
+      console.log('❌ BLOCKING exterior exit - player was in docked ship, calling exitShip() instead');
+      exitShip();
+      return;
+    }
+    
     console.log('Seamless exit - switching from kinematic to dynamic, preserving natural position');
     
     // Get current interior state
@@ -1389,10 +1640,13 @@
     relativePos.applyQuaternion(shipQuat);
     
     const exteriorX = shipPos.x + relativePos.x;
-    const exteriorY = shipPos.y + relativePos.y;
+    // Ensure player is above ground (minimum Y of 1.5 for capsule height)
+    const exteriorY = Math.max(shipPos.y + relativePos.y, 1.5);
     const exteriorZ = shipPos.z + relativePos.z;
     
     console.log('Converting kinematic body to dynamic at natural position:', { exteriorX, exteriorY, exteriorZ });
+    console.log('Ship position:', shipPos);
+    console.log('Relative position after rotation:', relativePos);
     
     // Create new dynamic body at the actual transformed position
     const dynamicBodyDesc = RAPIER.RigidBodyDesc.dynamic()
@@ -1426,20 +1680,44 @@
     playerBody = newDynamicBody;
     playerCollider = newCollider;
     
+    // Update proxy context to exterior immediately after switching bodies
+    exitToExterior(playerBody);
+    
     // Transform velocity to world coordinates naturally
     const exitVel = new THREE.Vector3(currentInteriorVel.x, currentInteriorVel.y, currentInteriorVel.z);
     exitVel.applyQuaternion(shipQuat);
     
-    // Apply the transformed velocity as-is (let physics handle collisions naturally)
-    playerBody.setLinvel({ x: exitVel.x, y: exitVel.y, z: exitVel.z }, true);
+    // Apply the transformed velocity with a small upward component to prevent floor clipping
+    const safeExitVel = {
+      x: exitVel.x,
+      y: Math.max(exitVel.y, 0.5), // Ensure slight upward velocity
+      z: exitVel.z
+    };
+    playerBody.setLinvel(safeExitVel, true);
     
-    // Switch state
-    isInsideShip = false;
+    // Apply a small upward impulse to help clear any floor collision
+    playerBody.applyImpulse({ x: 0, y: 0.5, z: 0 }, true);
+    
+    // Verify the collider is solid (not a sensor)
+    console.log('Player collider created:', playerCollider ? 'Yes' : 'No');
+    console.log('Player collider is sensor:', playerCollider?.isSensor());
+    console.log('Player body type:', playerBody.bodyType());
+    
+    // Hide interior player body to prevent physics conflicts
+    interiorPlayerBody.setTranslation({ x: 0, y: -100, z: 0 }, true);
+    interiorPlayerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    
+    // No cooldown needed - physics-based system handles re-entry naturally
+    // lastShipExitToExteriorTime = Date.now(); // Removed cooldown
+    
+    // Switch state - handled by physics-based detection
     isExiting = false;
     
     // Force a physics step to ensure proper collision detection
     exteriorWorld.timestep = 1/60;
     exteriorWorld.step(exteriorEventQueue);
+    
+    console.log('Exit to exterior complete - player body at:', playerBody.translation());
     
     console.log('Seamlessly switched to dynamic body - type:', playerBody.bodyType());
     console.log('Natural exit position:', playerBody.translation());
@@ -1451,6 +1729,13 @@
     if (isEntering || isInsideStation) return; // Prevent multiple calls and double entry
     isEntering = true;
     console.log('Direct station entry - converting player to station physics');
+    
+    // Update proxy context for station entry
+    enterStationWorld(stationPlayerBody);
+    
+    // Reset camera to consistent angle when entering station
+    cameraRotation.yaw = 0;
+    cameraRotation.pitch = 0;
     
     // Additional safety check - ensure we have valid bodies
     if (!playerBody || !playerCollider || !stationPlayerBody) {
@@ -1493,7 +1778,7 @@
     // Switch to kinematic body
     playerBody = newKinematicBody;
     playerCollider = newCollider;
-    isInsideStation = true;
+    lastStationEntryTime = Date.now(); // Prevent immediate exit detection
     
     // Set station player to relative position
     stationPlayerBody.setTranslation({ 
@@ -1515,11 +1800,11 @@
       };
       
       const dockingBayWidth = 60, dockingBayHeight = 30;
-      const stationLength = 250;
+      // Use global constants
       // Check if ship is in docking bay area
       const isShipInDockingBay = Math.abs(shipRelativeToStation.x) < dockingBayWidth/2 && 
                                 shipRelativeToStation.y > 0 && shipRelativeToStation.y < dockingBayHeight &&
-                                shipRelativeToStation.z > stationLength/2 - 40 && shipRelativeToStation.z < stationLength/2;
+                                shipRelativeToStation.z > STATION_LENGTH/2 - 40 && shipRelativeToStation.z < STATION_LENGTH/2;
       
       if (isShipInDockingBay) {
         console.log('Ship found inside docking bay on station entry - auto re-docking');
@@ -1554,16 +1839,20 @@
     const stationPos = stationBody.translation();
     const stationRot = stationBody.rotation();
     
-    // Calculate relative position inside station (ship pos - station pos)
+    // Calculate relative position inside station (ship pos - station pos)  
+    // Preserve actual ship position for seamless transition
     const relativeX = currentShipPos.x - stationPos.x;
-    const relativeY = currentShipPos.y - stationPos.y;
+    const relativeY = currentShipPos.y - stationPos.y; // Preserve actual Y position
     const relativeZ = currentShipPos.z - stationPos.z;
     
-    // Apply inverse station rotation for interior coordinates
+    // Apply inverse station rotation for interior coordinates (except Y which is floor-aligned)
     const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
     const stationQuatInverse = stationQuat.clone().invert();
-    const relativePos = new THREE.Vector3(relativeX, relativeY, relativeZ);
-    relativePos.applyQuaternion(stationQuatInverse);
+    const relativePosXZ = new THREE.Vector3(relativeX, 0, relativeZ);
+    relativePosXZ.applyQuaternion(stationQuatInverse);
+    
+    // Keep Y coordinate for proper floor alignment, only rotate X and Z
+    const relativePos = new THREE.Vector3(relativePosXZ.x, relativeY, relativePosXZ.z);
     
     console.log('Switching control - relative position:', { x: relativePos.x.toFixed(2), y: relativePos.y.toFixed(2), z: relativePos.z.toFixed(2) });
     
@@ -1591,7 +1880,7 @@
     stationShipBody.setLinvel({ x: currentShipVel.x, y: currentShipVel.y, z: currentShipVel.z }, true);
     
     console.log('Ship docked at station-relative position:', { x: relativePos.x, y: relativePos.y, z: relativePos.z });
-    console.log('Ship floor will be at Y:', (relativePos.y - 2.0).toFixed(2), '(station floor at Y=1.0)');
+    console.log('Ship Y position preserved at:', relativePos.y.toFixed(2), '(seamless transition)');
     
     // Transform ship rotation to station-relative coordinates
     const shipQuat = new THREE.Quaternion(currentShipRot.x, currentShipRot.y, currentShipRot.z, currentShipRot.w);
@@ -1622,15 +1911,11 @@
     const currentShipRot = shipBody.rotation();
     const stationPos = stationBody.translation();
     
-    // Position ship properly within station interior docking bay
-    // Station interior coordinates: center at (0,0,0), docking bay at front (positive Z)
-    const stationWidth = 200, stationHeight = 60, stationLength = 250;
-    const dockingBayDepth = 80;
-    
-    // Position ship in the middle of the docking bay area
-    const relativeX = 0; // Center of docking bay width
-    const relativeY = 6; // Above the station floor (floor at Y=1, ship floor at Y=6)  
-    const relativeZ = stationLength / 2 - dockingBayDepth / 2; // Middle of docking bay depth
+    // Calculate actual relative position inside station (preserve current position)
+    // Transform from exterior world coordinates to station interior coordinates
+    const relativeX = currentShipPos.x - stationPos.x;
+    const relativeY = currentShipPos.y - stationPos.y; // Preserve actual Y for seamless transition
+    const relativeZ = currentShipPos.z - stationPos.z;
     
     console.log('Ship docking at station interior position:', { relativeX, relativeY, relativeZ });
     console.log('Station interior bounds: Floor Y=1, Ceiling Y=59, Walls X=±99, Z=±124');
@@ -1654,27 +1939,21 @@
       .setRotation(currentShipRot);
     shipBody = exteriorWorld.createRigidBody(kinematicShipBodyDesc);
     
-    // Create sensor colliders for exterior kinematic ship
-    const shipWidth = 20, shipHeight = 6, shipLength = 30, wallThickness = 0.4;
-    const doorWidth = 4, doorHeight = 4;
-    
-    // Floor sensor (for general ship detection)
-    const shipFloorCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, wallThickness / 2, shipLength / 2)
-      .setTranslation(0, wallThickness / 2, 0)
-      .setSensor(true);
-    exteriorWorld.createCollider(shipFloorCollider, shipBody);
-    
-    // Door sensor (for player entry) - matching the working exterior ship sensor positioning
-    const exteriorDoorSensorCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2 - 0.5, doorHeight / 2 - 0.5, 0.1)
-      .setTranslation(0, doorHeight / 2, shipLength / 2 - wallThickness - 2.0)
-      .setSensor(true)
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
-    exteriorWorld.createCollider(exteriorDoorSensorCollider, shipBody);
+    // Re-add ship colliders to kinematic body (kinematic bodies still need colliders for collision detection)
+    createShipColliders(shipBody);
     
     // Activate ship physics in station world
     stationShipBody.setTranslation({ x: relativeX, y: relativeY, z: relativeZ }, true);
     stationShipBody.setRotation(currentShipRot, true);
     stationShipBody.setLinvel({ x: currentShipVel.x, y: currentShipVel.y, z: currentShipVel.z }, true);
+    
+    // Log the ship body and its sensors for debugging
+    console.log('Station ship body activated at:', stationShipBody.translation());
+    console.log('Station ship body has', stationShipBody.numColliders(), 'colliders');
+    for (let i = 0; i < stationShipBody.numColliders(); i++) {
+      const collider = stationShipBody.collider(i);
+      console.log(`  Collider ${i}: isSensor=${collider.isSensor()}, translation=`, collider.translation());
+    }
     
     isShipDocked = true;
     
@@ -1701,11 +1980,17 @@
     console.log('Seamlessly undocking ship - switching to exterior physics control');
     isShipDocked = false;
     
-    // Get current ship state from station world
-    const currentShipPos = shipBody.translation();
-    const currentShipRot = shipBody.rotation();
+    // Get current ship state from station world (transform back to exterior coordinates)
+    const stationShipPos = stationShipBody.translation();
+    const stationShipRot = stationShipBody.rotation();
     const stationShipVel = stationShipBody.linvel();
     const stationShipAngVel = stationShipBody.angvel();
+    const stationPos = stationBody.translation();
+    
+    // Transform station-relative position back to world coordinates (reverse of entry transformation)
+    const worldX = stationShipPos.x + stationPos.x;
+    const worldY = stationShipPos.y + stationPos.y;
+    const worldZ = stationShipPos.z + stationPos.z;
     
     // Convert kinematic ship back to dynamic body (exact ship exit pattern)
     console.log('Removing kinematic body...');
@@ -1718,10 +2003,10 @@
     }
     exteriorWorld.removeRigidBody(shipBody);
     
-    console.log('Creating new dynamic body at:', { x: currentShipPos.x, y: currentShipPos.y, z: currentShipPos.z });
+    console.log('Creating new dynamic body at:', { x: worldX, y: worldY, z: worldZ });
     const dynamicShipBodyDesc = RAPIER.RigidBodyDesc.dynamic()
-      .setTranslation(currentShipPos.x, currentShipPos.y, currentShipPos.z)
-      .setRotation(currentShipRot)
+      .setTranslation(worldX, worldY, worldZ)
+      .setRotation(stationShipRot)
       .setCanSleep(false)
       .setLinearDamping(0.5)
       .setAngularDamping(2.0);
@@ -1734,69 +2019,15 @@
     shipBody.setLinvel({ x: stationShipVel.x, y: stationShipVel.y, z: stationShipVel.z }, true);
     shipBody.setAngvel({ x: stationShipAngVel.x, y: stationShipAngVel.y, z: stationShipAngVel.z }, true);
     
-    // Recreate full ship colliders (not sensors) - same as original ship creation
-    const shipWidth = 20, shipHeight = 6, shipLength = 30, wallThickness = 0.4;
-    const doorWidth = 4, doorHeight = 4;
-    
-    // Ship floor
-    const shipFloorCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, wallThickness / 2, shipLength / 2)
-      .setTranslation(0, wallThickness / 2, 0);
-    exteriorWorld.createCollider(shipFloorCollider, shipBody);
-    
-    // Ship ceiling
-    const shipCeilingCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, wallThickness / 2, shipLength / 2)
-      .setTranslation(0, shipHeight - wallThickness / 2, 0);
-    exteriorWorld.createCollider(shipCeilingCollider, shipBody);
-    
-    // Ship walls
-    const shipLeftWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2)
-      .setTranslation(-shipWidth / 2 + wallThickness / 2, shipHeight / 2, 0);
-    exteriorWorld.createCollider(shipLeftWallCollider, shipBody);
-    
-    const shipRightWallCollider = RAPIER.ColliderDesc.cuboid(wallThickness / 2, shipHeight / 2, shipLength / 2)
-      .setTranslation(shipWidth / 2 - wallThickness / 2, shipHeight / 2, 0);
-    exteriorWorld.createCollider(shipRightWallCollider, shipBody);
-    
-    const shipBackWallCollider = RAPIER.ColliderDesc.cuboid(shipWidth / 2, shipHeight / 2, wallThickness / 2)
-      .setTranslation(0, shipHeight / 2, -shipLength / 2 + wallThickness / 2);
-    exteriorWorld.createCollider(shipBackWallCollider, shipBody);
-    
-    // Ship front walls with door opening
-    const frontWallLeftCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2)
-      .setTranslation(-(shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2);
-    exteriorWorld.createCollider(frontWallLeftCollider, shipBody);
-    
-    const frontWallRightCollider = RAPIER.ColliderDesc.cuboid((shipWidth - doorWidth) / 4, shipHeight / 2, wallThickness / 2)
-      .setTranslation((shipWidth + doorWidth) / 4, shipHeight / 2, shipLength / 2 - wallThickness / 2);
-    exteriorWorld.createCollider(frontWallRightCollider, shipBody);
-    
-    const frontWallTopCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2, (shipHeight - doorHeight) / 2, wallThickness / 2)
-      .setTranslation(0, shipHeight - (shipHeight - doorHeight) / 2, shipLength / 2 - wallThickness / 2);
-    exteriorWorld.createCollider(frontWallTopCollider, shipBody);
-
-    // Create exterior door sensor for ship entry detection
-    const exteriorDoorSensorCollider = RAPIER.ColliderDesc.cuboid(doorWidth / 2 - 0.5, doorHeight / 2 - 0.5, 0.1)
-      .setTranslation(0, doorHeight / 2, shipLength / 2 - wallThickness - 2.0)
-      .setSensor(true)
-      .setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
-    exteriorWorld.createCollider(exteriorDoorSensorCollider, shipBody);
+    // Recreate ship colliders using same function as initial creation
+    createShipColliders(shipBody);
+    console.log('✅ Ship colliders recreated after undocking - count:', shipBody.numColliders());
     
     console.log('Exterior ship taking control at:', shipBody.translation());
     console.log('Ship body type:', shipBody.bodyType());
     console.log('Ship body handle:', shipBody.handle);
     
-    // Verify body is properly added to world
-    console.log('Exterior world bodies count:', exteriorWorld.bodies.len());
-    console.log('Exterior world colliders count:', exteriorWorld.colliders.len());
-    
-    // Verify colliders were created
-    console.log('Ship body colliders count:', shipBody.numColliders());
-    for (let i = 0; i < shipBody.numColliders(); i++) {
-      const collider = shipBody.collider(i);
-      if (collider) {
-        console.log(`  Collider ${i}: sensor=${collider.isSensor()}`);
-      }
-    }
+    // Ship physics body created with colliders (removed detailed logs)
     
     // Force a small forward impulse to ensure physics activation
     shipBody.applyImpulse({ x: 0, y: 0, z: 1 }, true);
@@ -1813,19 +2044,16 @@
       console.log('Station ship proxy hidden');
     }
     
-    // Test that ship body is responsive
-    setTimeout(() => {
-      console.log('Ship position after 100ms:', shipBody.translation());
-      console.log('Ship velocity:', shipBody.linvel());
-    }, 100);
+    // Ship undocking complete (removed position tracking logs)
     
     // Set undock cooldown to prevent immediate re-docking
     lastUndockTime = Date.now();
-    console.log('Undock cooldown set - ship cannot re-dock for 2 seconds');
+    // Undock cooldown set
   }
 
   function exitShip() {
     console.log('=== PLAYER EXITING SHIP ===');
+    console.log('Current proxy context:', playerProxyContext);
     console.log('Ship docking status check: isShipDocked =', isShipDocked);
     console.log('Ship exterior body position:', shipBody.translation());
     if (stationShipBody) {
@@ -1833,40 +2061,59 @@
     }
     console.log('Player current location: isInsideStation =', isInsideStation);
     
-    isInsideShip = false;
+    // Remove explicit state setting - will be handled by proxy context updates
     
     // Get current interior player state
     const currentInteriorPos = interiorPlayerBody.translation();
     const currentInteriorVel = interiorPlayerBody.linvel();
     
-    // Determine exit context based on ship's current position, not just docking status
-    // If ship is inside the station docking bay bounds, player should exit to station interior
-    const shipPos = shipBody.translation();
-    const stationPos = stationBody.translation();
+    // Determine exit context - if ship is docked, use that status directly
+    // When docked, ship is in station world, not exterior world
+    let isShipInsideStation = false;
     
-    // Check if ship is within station bounds (more reliable than docking status)
-    const relativeToStation = {
-      x: shipPos.x - stationPos.x,
-      y: shipPos.y - stationPos.y,
-      z: shipPos.z - stationPos.z
-    };
+    if (isShipDocked) {
+      // Ship is docked - use station physics position to check bounds
+      const stationShipPos = stationShipBody.translation();
+      // Station interior bounds in station world coordinates
+      isShipInsideStation = Math.abs(stationShipPos.x) < (STATION_WIDTH/2 - STATION_WALL_THICKNESS) && 
+                           stationShipPos.y > 0 && stationShipPos.y < STATION_HEIGHT &&
+                           Math.abs(stationShipPos.z) < (STATION_LENGTH/2 - STATION_WALL_THICKNESS);
+      
+      console.log('Ship is docked - checking station world position:', stationShipPos);
+      console.log('  Is ship inside station bounds (station world):', isShipInsideStation);
+    } else {
+      // Ship not docked - check exterior world position
+      const shipPos = shipBody.translation();
+      const stationPos = stationBody.translation();
+      const relativeToStation = {
+        x: shipPos.x - stationPos.x,
+        y: shipPos.y - stationPos.y,
+        z: shipPos.z - stationPos.z
+      };
+      
+      // Station bounds in exterior world
+      isShipInsideStation = Math.abs(relativeToStation.x) < (STATION_WIDTH/2 - STATION_WALL_THICKNESS) && 
+                           relativeToStation.y > STATION_WALL_THICKNESS && relativeToStation.y < (STATION_HEIGHT - STATION_WALL_THICKNESS) &&
+                           Math.abs(relativeToStation.z) < (STATION_LENGTH/2 - STATION_WALL_THICKNESS);
+      
+      console.log('Ship not docked - checking exterior world position:', shipPos);
+      console.log('  Station world pos:', stationPos);
+      console.log('  Ship relative to station:', relativeToStation);
+      console.log('  Is ship inside station bounds (exterior):', isShipInsideStation);
+    }
     
-    // Station interior bounds: ±99 X, 1-59 Y, ±124 Z
-    const isShipInsideStation = Math.abs(relativeToStation.x) < 90 && 
-                                relativeToStation.y > -5 && relativeToStation.y < 65 &&
-                                Math.abs(relativeToStation.z) < 120;
-    
-    console.log('Ship position context check:');
-    console.log('  Ship world pos:', shipPos);
-    console.log('  Station world pos:', stationPos);
-    console.log('  Ship relative to station:', relativeToStation);
-    console.log('  Is ship inside station bounds:', isShipInsideStation);
     console.log('  Docking status (isShipDocked):', isShipDocked);
     
-    // Use position context instead of docking status for exit decision
-    if (isShipInsideStation) {
+    // Use position context for exit decision
+    // Only exit to station if ship is CURRENTLY docked or inside station bounds
+    // Don't use proxy hierarchy as it reflects past state, not current position
+    
+    if (isShipDocked || isShipInsideStation) {
       console.log('Ship is inside station - player entering station interior');
-      isInsideStation = true;
+      console.log('Exit reason: isShipDocked=' + isShipDocked + ', isShipInsideStation=' + isShipInsideStation);
+      
+      // Update proxy context to station
+      exitToStation(stationPlayerBody);
       
       // Ensure ship physics is active in station world if not already
       if (!isShipDocked) {
@@ -1876,11 +2123,16 @@
         const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
         const stationQuatInverse = stationQuat.clone().invert();
         
-        // Convert ship position to station-relative coordinates
+        // Convert ship position to station-relative coordinates preserving actual position  
+        // Use actual Y position for seamless transition
         const worldRelativePos = new THREE.Vector3(
           relativeToStation.x, relativeToStation.y, relativeToStation.z
         );
-        worldRelativePos.applyQuaternion(stationQuatInverse);
+        // Only rotate X and Z, keep Y fixed for floor alignment
+        const worldRelativePosXZ = new THREE.Vector3(relativeToStation.x, 0, relativeToStation.z);
+        worldRelativePosXZ.applyQuaternion(stationQuatInverse);
+        worldRelativePos.x = worldRelativePosXZ.x;
+        worldRelativePos.z = worldRelativePosXZ.z;
         
         // Activate ship physics in station world
         stationShipBody.setTranslation({ x: worldRelativePos.x, y: worldRelativePos.y, z: worldRelativePos.z }, true);
@@ -1903,23 +2155,56 @@
       const shipQuat = new THREE.Quaternion(stationShipRot.x, stationShipRot.y, stationShipRot.z, stationShipRot.w);
       
       // Transform player position from ship interior to station interior
+      // More natural transition - keep relative position but ensure safe placement
       const relativePos = new THREE.Vector3(currentInteriorPos.x, currentInteriorPos.y, currentInteriorPos.z);
       relativePos.applyQuaternion(shipQuat);
       
-      // Position player in station relative to docked ship
-      // Place player on station floor - station floor top surface is at Y=0.4, player capsule height is 1.5
-      const stationFloorY = 0.4 + 1.5/2 + 0.5; // Floor surface + half capsule height + extra clearance = 1.65
+      // Position player naturally relative to ship, with safe floor placement
+      const naturalX = stationShipPos.x + relativePos.x;
+      const naturalZ = stationShipPos.z + relativePos.z;
+      
+      // For Y, preserve natural position relative to ship for seamless transition
+      // Don't force floor alignment - let player exit at their natural position
+      const naturalY = stationShipPos.y + relativePos.y;
+      
+      // Safety check: ensure player doesn't end up below station floor
+      const minStationY = STATION_WALL_THICKNESS / 2 + 0.5; // Minimum safe Y in station
+      const finalY = Math.max(naturalY, minStationY); // Use natural Y but ensure above floor
+      
+      if (finalY !== naturalY) {
+        console.warn('Player exit Y adjusted from', naturalY.toFixed(2), 'to', finalY.toFixed(2), 'for station floor safety');
+      }
+      
       const stationPlayerPos = {
-        x: stationShipPos.x + relativePos.x,
-        y: stationFloorY, // Always place on station floor, not ship height
-        z: stationShipPos.z + relativePos.z
+        x: naturalX,
+        y: finalY,
+        z: naturalZ
       };
+      
+      console.log('Ship position in station:', { x: stationShipPos.x.toFixed(2), y: stationShipPos.y.toFixed(2), z: stationShipPos.z.toFixed(2) });
+      console.log('Player positioned at:', { x: naturalX.toFixed(2), y: finalY.toFixed(2), z: naturalZ.toFixed(2) });
+      console.log('Player relative pos in ship:', { x: relativePos.x.toFixed(2), y: relativePos.y.toFixed(2), z: relativePos.z.toFixed(2) });
       
       // Set station player body position
       stationPlayerBody.setTranslation(stationPlayerPos, true);
       stationPlayerBody.setLinvel({ x: currentInteriorVel.x, y: currentInteriorVel.y, z: currentInteriorVel.z }, true);
       
+      // Ensure station player collider is properly active for collision detection
+      if (stationPlayerCollider) {
+        console.log('🔍 Station player collider exists - handle:', stationPlayerCollider.handle);
+      } else {
+        console.warn('⚠️ Station player collider missing after ship-to-station exit!');
+      }
+      
       console.log('Player entered station at:', stationPlayerPos);
+      
+      // Debug: Check player collision state after ship-to-station exit
+      console.log('🔍 Player state after ship-to-station exit:', {
+        stationPlayerBodyExists: !!stationPlayerBody,
+        stationPlayerBodyType: stationPlayerBody?.bodyType(),
+        playerProxyContext: playerProxyContext.activeWorld,
+        hierarchy: playerProxyContext.hierarchy
+      });
       
       // Update exterior player body to match station position to prevent collision re-entry
       // Convert station-relative position back to world coordinates
@@ -1940,6 +2225,9 @@
       interiorPlayerBody.setTranslation({ x: 0, y: -100, z: 0 }, true);
       interiorPlayerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
       
+      // No cooldown needed - physics-based system handles re-entry naturally  
+      // lastShipExitToStationTime = Date.now(); // Removed cooldown
+      
       // Reset exiting flag - critical for allowing ship re-entry in station
       isExiting = false;
       
@@ -1948,6 +2236,10 @@
     
     // Not docked - normal exit to exterior
     console.log('Exiting ship to exterior');
+    
+    // Update proxy context to exterior
+    exitToExterior(playerBody);
+    
     const currentShipPos = shipBody.translation();
     
     // Calculate exterior world position with ship rotation
@@ -2022,13 +2314,19 @@
   }
   
   function enterShipFromStation() {
-    if (isEntering || isInsideShip) return; // Prevent multiple calls and double entry
+    // Check if we're already in the process of entering or already in a ship from station
+    if (isEntering || playerProxyContext.activeWorld === 'ship') return; // Prevent multiple calls and double entry
     isEntering = true;
     console.log('🚀 ENTERING SHIP FROM STATION - NESTED STATIC PROXY TRANSITION');
-    console.log('  Before: isInsideStation =', isInsideStation, ', isInsideShip =', isInsideShip);
-    isInsideStation = false;
-    isInsideShip = true;
-    console.log('  After: isInsideStation =', isInsideStation, ', isInsideShip =', isInsideShip);
+    console.log('  Before proxy context:', playerProxyContext);
+    
+    // Reset camera to consistent angle when entering ship from station
+    cameraRotation.yaw = 0;
+    cameraRotation.pitch = 0;
+    
+    // Update proxy context for nested ship entry
+    enterShipFromStationContext(interiorPlayerBody);
+    console.log('  After proxy context:', playerProxyContext);
     console.log('  Should now render ship interior view only');
     
     // Get current station player state
@@ -2102,8 +2400,10 @@
   
   function exitStation() {
     console.log('=== PLAYER EXITING STATION ===');
-    console.log('Current player state: isInsideStation =', isInsideStation, ', isInsideShip =', isInsideShip);
-    isInsideStation = false;
+    console.log('Current proxy context:', playerProxyContext);
+    
+    // Update proxy context to exterior
+    exitToExterior(playerBody);
     
     // Get current station player state
     const currentStationPos = stationPlayerBody.translation();
@@ -2177,9 +2477,8 @@
     stationPlayerBody.setTranslation({ x: 0, y: -200, z: 0 }, true);
     stationPlayerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
     
-    // Set cooldown to prevent immediate station re-entry after exiting
-    lastShipExitToStationTime = Date.now();
-    console.log('Station exit cooldown set - preventing re-entry for 1 second');
+    // Note: No cooldown needed for station exit - player should be able to re-enter station immediately
+    // lastShipExitToStationTime is only set when exiting ship to station, not when exiting station to exterior
     
     // Test that player body is responsive
     setTimeout(() => {
@@ -2245,7 +2544,7 @@
       }
     } catch (error) {
       console.warn('Error checking grounded state:', error);
-      isGrounded = false; // Safe fallback
+      isGrounded = false;
     }
   }
   
@@ -2308,6 +2607,11 @@
     
     currentPlayerBody.applyImpulse(impulse, true);
     
+    // Debug station player movement
+    if (isInsideStation && (impulse.x !== 0 || impulse.z !== 0)) {
+      // Movement impulse applied (removed verbose log)
+    }
+    
     const pos = currentPlayerBody.translation();
     
     // Update player mesh position and sync kinematic body if inside ship
@@ -2320,45 +2624,64 @@
         debugPlayerMesh.visible = false;
       }
       
-      // Sync exterior kinematic body with interior dynamic body position
-      // Transform interior position to exterior world coordinates with ship rotation
-      const shipPos = shipBody.translation();
-      const shipRot = shipBody.rotation();
-      const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
+      let exteriorPos;
       
-      // Apply ship rotation to interior relative position
-      const relativePos = new THREE.Vector3(pos.x, pos.y, pos.z);
-      relativePos.applyQuaternion(shipQuat);
-      
-      const exteriorPos = {
-        x: shipPos.x + relativePos.x,
-        y: shipPos.y + relativePos.y,
-        z: shipPos.z + relativePos.z
-      };
+      if (isShipDocked && stationShipBody) {
+        // Transform interior player position through station world to exterior world
+        // Step 1: Transform interior position to station world coordinates
+        const stationShipPos = stationShipBody.translation();
+        const stationShipRot = stationShipBody.rotation();
+        const stationShipQuat = new THREE.Quaternion(stationShipRot.x, stationShipRot.y, stationShipRot.z, stationShipRot.w);
+        
+        const relativePos = new THREE.Vector3(pos.x, pos.y, pos.z);
+        relativePos.applyQuaternion(stationShipQuat);
+        
+        const stationWorldPos = new THREE.Vector3(
+          stationShipPos.x + relativePos.x,
+          stationShipPos.y + relativePos.y,
+          stationShipPos.z + relativePos.z
+        );
+        
+        // Step 2: Transform station world coordinates to exterior world coordinates
+        const stationPos = stationBody.translation();
+        const stationRot = stationBody.rotation();
+        const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
+        
+        stationWorldPos.applyQuaternion(stationQuat);
+        
+        exteriorPos = {
+          x: stationPos.x + stationWorldPos.x,
+          y: stationPos.y + stationWorldPos.y,
+          z: stationPos.z + stationWorldPos.z
+        };
+      } else {
+        // Direct transformation to exterior world coordinates
+        const shipPos = shipBody.translation();
+        const shipRot = shipBody.rotation();
+        const shipQuat = new THREE.Quaternion(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
+        
+        const relativePos = new THREE.Vector3(pos.x, pos.y, pos.z);
+        relativePos.applyQuaternion(shipQuat);
+        
+        exteriorPos = {
+          x: shipPos.x + relativePos.x,
+          y: shipPos.y + relativePos.y,
+          z: shipPos.z + relativePos.z
+        };
+      }
       
       playerBody.setNextKinematicTranslation(exteriorPos);
-      playerBody.setNextKinematicRotation(shipRot);
+      
+      // Use appropriate rotation based on ship location
+      const targetRotation = (isShipDocked && stationShipBody) ? stationShipBody.rotation() : shipBody.rotation();
+      playerBody.setNextKinematicRotation(targetRotation);
       
       // Position and rotate player mesh in real world interior (translated from static proxy)
       playerMesh.position.set(exteriorPos.x, exteriorPos.y, exteriorPos.z);
-      playerMesh.quaternion.set(shipRot.x, shipRot.y, shipRot.z, shipRot.w);
+      playerMesh.quaternion.set(targetRotation.x, targetRotation.y, targetRotation.z, targetRotation.w);
       
-      // Interior camera follows player with mouse look
-      if (isFirstPerson) {
-        // First person interior view - camera at proxy player position with mouse look
-        // Camera positioned at player head height (1.5 units above player center)
-        interiorCamera.position.set(pos.x, pos.y + 1.5, pos.z);
-        
-        // Apply mouse look rotation directly in interior space (not affected by ship rotation)
-        // This gives proper FPS control regardless of ship orientation
-        const mouseLookEuler = new THREE.Euler(cameraRotation.pitch, cameraRotation.yaw, 0, 'YXZ');
-        const mouseLookQuat = new THREE.Quaternion().setFromEuler(mouseLookEuler);
-        interiorCamera.quaternion.copy(mouseLookQuat);
-      } else {
-        // Third person interior view - fixed camera (zoomed out for better overview)
-        interiorCamera.position.set(0, 6, 18);
-        interiorCamera.lookAt(0, 1.5, 0);
-      }
+      // Interior camera has completely fixed position and angle - NEVER change it
+      // Camera position and angle are set once during initialization and remain constant
       
       // Exterior camera follows real world player representation when inside ship
       if (isFirstPerson) {
@@ -2429,8 +2752,8 @@
         stationCamera.quaternion.copy(mouseLookQuat);
       } else {
         // Third person station interior view - fixed camera (further back for large station)
-        stationCamera.position.set(0, 40, 100);
-        stationCamera.lookAt(0, 10, 0);
+        stationCamera.position.set(0, 100, 220);
+        stationCamera.lookAt(0, 20, 0);
       }
       
       // Exterior camera follows real world player representation when inside station
@@ -2503,11 +2826,7 @@
       const stationPos = stationBody.translation();
       const stationRot = stationBody.rotation();
       
-      // Debug logging (occasionally)
-      if (Math.random() < 0.01) { // 1% chance per frame
-        console.log('Ship in station world at:', stationShipPos);
-        console.log('Station world bounds - Floor at Y=1, Ceiling at Y=59, Walls at X=±99, Z=±124');
-      }
+      // Ship position tracking (removed random debug logs)
       
       // Convert station-relative position to world position (same logic as player sync)
       const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
@@ -2526,13 +2845,7 @@
       shipBody.setTranslation(worldShipPos, true);
       shipBody.setRotation(stationShipRot, true);
       
-      // Debug: Track ship position sync (only log occasionally to avoid spam)
-      if (Math.random() < 0.001) { // Log ~0.1% of frames
-        console.log('SYNC: Updating exterior ship position from station ship');
-        console.log('  Station ship pos:', stationShipPos);
-        console.log('  Station pos:', stationPos);
-        console.log('  World ship pos:', worldShipPos);
-      }
+      // Ship position sync (removed random debug logs)
       
       // Update ship mesh to match
       shipMesh.position.set(worldShipPos.x, worldShipPos.y, worldShipPos.z);
@@ -2544,7 +2857,7 @@
                           shipMovement.up || shipMovement.down;
       
       if (isMovingShip && isInsideShip) {
-        console.log('Applying ship movement forces to station physics body');
+        // Applying ship movement forces (removed verbose log)
         
         // Use station ship body for physics simulation
         const stationShipRotation = stationShipBody.rotation();
@@ -2566,7 +2879,13 @@
             y: forwardVector.y * thrustPower,
             z: forwardVector.z * thrustPower
           };
+          const thrustImpulse = {
+            x: forwardVector.x * thrustPower * deltaTime,
+            y: forwardVector.y * thrustPower * deltaTime,
+            z: forwardVector.z * thrustPower * deltaTime
+          };
           stationShipBody.addForce(thrustForce, true);
+          stationShipBody.applyImpulse(thrustImpulse, true);
         }
         
         // Vertical movement
@@ -2581,7 +2900,9 @@
         if (verticalThrust !== 0) {
           const verticalPower = 800; // Moderate power for docked ship
           const liftForce = { x: 0, y: verticalThrust * verticalPower, z: 0 };
+          const liftImpulse = { x: 0, y: verticalThrust * verticalPower * deltaTime, z: 0 };
           stationShipBody.addForce(liftForce, true);
+          stationShipBody.applyImpulse(liftImpulse, true);
         }
         
         // Yaw rotation
@@ -2595,16 +2916,18 @@
         
         if (yawTorque !== 0) {
           const torqueForce = { x: 0, y: yawTorque * torquePower, z: 0 };
+          const torqueImpulse = { x: 0, y: yawTorque * torquePower * deltaTime, z: 0 };
           stationShipBody.addTorque(torqueForce, true);
+          stationShipBody.applyTorqueImpulse(torqueImpulse, true);
         }
         
         // Check if ship has moved outside station boundaries - if so, automatically undock
         const currentStationShipPos = stationShipBody.translation();
-        const stationLength = 250, stationWidth = 200, stationHeight = 60;
+        // Use global constants
         const stationBounds = {
-          minX: -stationWidth/2, maxX: stationWidth/2,
-          minY: 1, maxY: stationHeight - 1,  
-          minZ: -stationLength/2, maxZ: stationLength/2
+          minX: -STATION_WIDTH/2, maxX: STATION_WIDTH/2,
+          minY: 1, maxY: STATION_HEIGHT - 1,  
+          minZ: -STATION_LENGTH/2, maxZ: STATION_LENGTH/2
         };
         
         const isOutsideStation = 
@@ -2652,14 +2975,14 @@
         z: forwardVector.z * thrustPower * deltaTime
       };
       
-      console.log('Applying thrust - Force:', thrustForce, 'Impulse:', thrustImpulse);
-      console.log('Ship position before thrust:', shipBody.translation());
+      // Thrust applied (removed verbose force/impulse log)
+      // Ship thrust applied
       
       // Apply both force and impulse for maximum effect
       shipBody.addForce(thrustForce, true);
       shipBody.applyImpulse(thrustImpulse, true);
       
-      console.log('Ship velocity after thrust:', shipBody.linvel());
+      // Ship velocity updated
     }
     
     // Vertical movement (Q/E for external flight, R/Y for interior piloting)
@@ -2723,7 +3046,7 @@
     // Interior proxy always stays at origin (static)
     if (isInsideShip) {
       shipInteriorProxy.position.set(0, 0, 0);
-      interiorCamera.lookAt(0, 1.5, 0);
+      // Interior camera angle is fixed - don't change it
     }
     
     } catch (error) {
@@ -2812,27 +3135,14 @@
       stationShipProxy.position.set(stationShipPos.x, stationShipPos.y, stationShipPos.z);
       stationShipProxy.quaternion.set(stationShipRot.x, stationShipRot.y, stationShipRot.z, stationShipRot.w);
       
-      // Debug logging for alignment issues - more frequent to catch mismatch
-      if (frameCount % 180 === 0) { // Every 3 seconds
-        console.log('🔧 Station ship alignment check:');
-        console.log('  Physics body pos:', { x: stationShipPos.x.toFixed(2), y: stationShipPos.y.toFixed(2), z: stationShipPos.z.toFixed(2) });
-        console.log('  Physics body rot:', { x: stationShipRot.x.toFixed(3), y: stationShipRot.y.toFixed(3), z: stationShipRot.z.toFixed(3), w: stationShipRot.w.toFixed(3) });
-        console.log('  Visual proxy pos:', { x: stationShipProxy.position.x.toFixed(2), y: stationShipProxy.position.y.toFixed(2), z: stationShipProxy.position.z.toFixed(2) });
-        console.log('  Visual proxy rot:', { x: stationShipProxy.quaternion.x.toFixed(3), y: stationShipProxy.quaternion.y.toFixed(3), z: stationShipProxy.quaternion.z.toFixed(3), w: stationShipProxy.quaternion.w.toFixed(3) });
-        console.log('  Proxy visible:', stationShipProxy.visible);
-        console.log('  Position match?', Math.abs(stationShipPos.x - stationShipProxy.position.x) < 0.1 && 
-                                         Math.abs(stationShipPos.y - stationShipProxy.position.y) < 0.1 && 
-                                         Math.abs(stationShipPos.z - stationShipProxy.position.z) < 0.1);
-        console.log('  Ship floor physics at Y:', (stationShipPos.y - 2.0).toFixed(2), '(station floor at Y=1)');
-        console.log('  Ship bounds: X±10, Y:', (stationShipPos.y - 1).toFixed(2), 'to', (stationShipPos.y + 6).toFixed(2), ', Z±15');
-        
-        // Check if ship is positioned correctly relative to station floor
-        if (stationShipPos.y < 1.0) {
-          console.log('  ⚠️  WARNING: Ship physics body is below station floor! Should be at Y≥1.4');
-        }
-        if (Math.abs(stationShipPos.y - stationShipProxy.position.y) > 0.1) {
-          console.log('  ⚠️  WARNING: Physics body and visual proxy Y positions do not match!');
-        }
+      // Minimal alignment check (removed verbose logging)
+      
+      // Check if ship is positioned correctly relative to station floor
+      if (stationShipPos.y < 1.0) {
+        console.log('  ⚠️  WARNING: Ship physics body is below station floor! Should be at Y≥1.4');
+      }
+      if (Math.abs(stationShipPos.y - stationShipProxy.position.y) > 0.1) {
+        console.log('  ⚠️  WARNING: Physics body and visual proxy Y positions do not match!');
       }
       
       if (!stationShipProxy.visible) {
@@ -2883,25 +3193,30 @@
               if (!isInsideShip && !isInsideStation && !isExiting && !isTransitioning && !isEntering && (collider1 === playerCollider || collider2 === playerCollider)) {
                 const otherCollider = collider1 === playerCollider ? collider2 : collider1;
                 
-                // Check if colliding with ship door sensor
+                // Debug: Check sensor collision detection
+                if (otherCollider && otherCollider.isSensor()) {
+                  console.log('🔍 Player hitting sensor after undock:', {
+                    isSensor: true,
+                    parentIsShipBody: otherCollider.parent() === shipBody,
+                    shipBodyExists: !!shipBody,
+                    shipBodyHandle: shipBody?.handle,
+                    otherColliderParentHandle: otherCollider.parent()?.handle,
+                    playerConditions: { isInsideShip, isInsideStation, isExiting, isTransitioning, isEntering }
+                  });
+                }
+                
+                // Check if colliding with ship door sensor (immediate entry)
                 if (otherCollider && otherCollider.isSensor() && otherCollider.parent() === shipBody) {
                   const playerPos = playerBody.translation();
                   console.log('SHIP ENTRY DETECTED - Deferring entry until after physics step:', playerPos);
                   pendingShipEntry = true;
                 }
                 
-                // Check if colliding with station entry sensor (with cooldown to prevent re-entry after ship exit) - only in exterior world
+                // Check if colliding with station entry sensor (immediate entry)
                 if (otherCollider && otherCollider.isSensor() && otherCollider.parent() === stationBody && !isInsideStation) {
-                  const currentTime = Date.now();
-                  const timeSinceShipExit = currentTime - lastShipExitToStationTime;
-                  
-                  if (timeSinceShipExit > 1000) { // 1 second cooldown after ship exit to station
-                    const playerPos = playerBody.translation();
-                    console.log('STATION ENTRY DETECTED - Deferring entry until after physics step:', playerPos);
-                    pendingStationEntry = true;
-                  } else {
-                    console.log('STATION ENTRY BLOCKED - Cooldown active after ship exit, time since exit:', timeSinceShipExit);
-                  }
+                  const playerPos = playerBody.translation();
+                  console.log('STATION ENTRY DETECTED - Deferring entry until after physics step:', playerPos);
+                  pendingStationEntry = true;
                 }
               }
               
@@ -2920,11 +3235,11 @@
         stationWorld.step(stationEventQueue);
         
         // Check for automatic exit based on momentum and clear path
-        if (isInsideShip && !isTransitioning) {
+        if (playerProxyContext.activeWorld === 'ship' && !isTransitioning) {
           checkAutoExit();
         }
         
-        if (isInsideStation && !isTransitioning) {
+        if (playerProxyContext.activeWorld === 'station' && !isTransitioning) {
           checkStationAutoExit();
         }
         
@@ -2933,43 +3248,95 @@
           // Remove sensor-based exit detection - now using momentum + raycast system
         });
         
+        
         // Process station collision events  
-        stationEventQueue.drainCollisionEvents((collider1, collider2, started) => {
+        stationEventQueue.drainCollisionEvents((handle1, handle2, started) => {
+          // Get colliders from handles
+          const collider1 = stationWorld.getCollider(handle1);
+          const collider2 = stationWorld.getCollider(handle2);
+          
+          // Debug all station collision events with detailed logging
+          const isPlayerInvolved = stationPlayerCollider && (collider1 === stationPlayerCollider || collider2 === stationPlayerCollider);
+          const collider1IsPlayer = collider1 === stationPlayerCollider;
+          const collider2IsPlayer = collider2 === stationPlayerCollider;
+          
+          if (isPlayerInvolved) {
+            console.log('🚪 Station collision event with player:', 
+              'started:', started,
+              'collider1IsPlayer:', collider1IsPlayer,
+              'collider2IsPlayer:', collider2IsPlayer, 
+              'proxyContext:', playerProxyContext.activeWorld,
+              'stationPlayerColliderExists:', !!stationPlayerCollider
+            );
+          }
+          
           if (!started) return; // Only process collision start events
           
           try {
             // Safety check - ensure colliders are valid
             if (!collider1 || !collider2) return;
             
-            // Debug: Log collisions in station world (when ship entry might be affected)
-            if (isInsideStation && isShipDocked && Math.random() < 0.1) { // 10% chance when conditions are right
-              const isPlayerCollision = stationPlayerCollider && (collider1 === stationPlayerCollider || collider2 === stationPlayerCollider);
-              if (isPlayerCollision) {
-                const otherCollider = collider1 === stationPlayerCollider ? collider2 : collider1;
-                console.log('🌟 Station player collision detected:');  
-                console.log('  Other collider parent:', otherCollider?.parent() === stationShipBody ? 'Ship' : 
-                           otherCollider?.parent() === stationBody ? 'Station' : 'Other');
-                console.log('  Player conditions for ship entry:', { 
-                  isInsideStation, 
-                  isShipDocked, 
-                  isInsideShip, 
-                  isExiting, 
-                  isTransitioning, 
-                  isEntering, 
-                  pendingShipEntryFromStation 
+            // Check for ship entry from station
+            const isPlayerCollision = stationPlayerCollider && (collider1 === stationPlayerCollider || collider2 === stationPlayerCollider);
+            if (isPlayerCollision) {
+              const otherCollider = collider1 === stationPlayerCollider ? collider2 : collider1;
+              const playerPos = stationPlayerBody.translation();
+              
+              // Log every collision to help debug
+              console.log('Station player collision detected with:', {
+                otherColliderExists: !!otherCollider,
+                otherColliderIsSensor: otherCollider?.isSensor(),
+                otherColliderParent: otherCollider?.parent(),
+                stationShipBody: stationShipBody,
+                parentIsStationShip: otherCollider?.parent() === stationShipBody
+              });
+              
+              // Debug all player collisions in station
+              console.log('🔍 Player collision in station:', {
+                playerPos: { x: playerPos.x.toFixed(2), y: playerPos.y.toFixed(2), z: playerPos.z.toFixed(2) },
+                isShipCollider: otherCollider?.parent() === stationShipBody,
+                isSensor: otherCollider?.isSensor(),
+                conditions: { isInsideStation, isShipDocked, isInsideShip, isTransitioning, isExiting, isEntering }
+              });
+              
+              // Debug ship sensor detection specifically
+              if (otherCollider?.parent() === stationShipBody) {
+                const shipPos = stationShipBody.translation();
+                console.log('🔍 Player hitting ship in station:', {
+                  isSensor: otherCollider?.isSensor(),
+                  playerPos: { x: playerPos.x, y: playerPos.y, z: playerPos.z },
+                  shipPos: { x: shipPos.x, y: shipPos.y, z: shipPos.z },
+                  distance: Math.sqrt((playerPos.x - shipPos.x)**2 + (playerPos.z - shipPos.z)**2),
+                  conditions: { isInsideStation, isShipDocked, isInsideShip, isTransitioning, isExiting, isEntering }
                 });
-                
-                // Check if this collision might be interfering with ship entry
-                if (otherCollider?.parent() === stationBody) {
-                  console.log('  → Player colliding with station walls/floor - this is normal');
-                } else if (otherCollider?.parent() === stationShipBody) {
-                  console.log('  → Player colliding with ship in station - checking if this affects entry logic');
+              }
+              
+              // Check ship entry conditions from station
+              
+              // Use proxy context to check if player is in station but not yet in ship
+              const canEnterShipFromStation = playerProxyContext.activeWorld === 'station' && 
+                                             isShipDocked && 
+                                             !isTransitioning && 
+                                             !isExiting && 
+                                             !isEntering;
+              
+              if (canEnterShipFromStation) {
+                // Check if player hit ship entry sensor in station world
+                if (otherCollider?.parent() === stationShipBody && otherCollider?.isSensor()) {
+                  console.log('🚀 Ship entry sensor triggered from station - entering ship');
+                  console.log('  Current proxy context:', playerProxyContext);
+                  pendingShipEntryFromStation = true;
+                } else {
+                  console.log('❌ Ship sensor not detected:', {
+                    otherColliderExists: !!otherCollider,
+                    parentMatches: otherCollider?.parent() === stationShipBody,
+                    isSensor: otherCollider?.isSensor()
+                  });
                 }
+              } else {
+                console.log('❌ Cannot enter ship - conditions not met');
               }
             }
-            
-            // Position-based ship entry detection moved to main frame loop
-            // No collision-based detection needed here
           } catch (error) {
             console.warn('Error processing station collision events:', error);
           }
@@ -3005,9 +3372,8 @@
         let shipPos, shipRelativeToStation, isShipInDockingBay;
         const stationPos = stationBody.translation();
         // Station interior bounds - use full interior space, not just docking bay entrance
-        const stationWidth = 200, stationHeight = 60, stationLength = 250;
-        const wallThickness = 2.0;
-        
+        // Use global constants
+            
         if (isShipDocked) {
           // When docked, use station ship body position (already in station coordinates)
           const stationShipPos = stationShipBody.translation();
@@ -3038,24 +3404,40 @@
           };
         }
         
-        // Check if ship is inside station interior bounds (full station space)
-        // Station interior bounds: X±99, Y(1-59), Z±124 (accounting for wall thickness)
-        const xInBounds = Math.abs(shipRelativeToStation.x) < (stationWidth/2 - wallThickness);
-        const yInBounds = shipRelativeToStation.y > wallThickness && shipRelativeToStation.y < (stationHeight - wallThickness);
-        const zInBounds = Math.abs(shipRelativeToStation.z) < (stationLength/2 - wallThickness);
+        // Check bounds based on whether ship is docked or not
+        let xInBounds, yInBounds, zInBounds;
+        
+        if (isShipDocked) {
+          // When docked, shipRelativeToStation is in station world coordinates
+          // Station interior bounds in station world: floor at Y=1, ceiling at Y=59
+          xInBounds = Math.abs(shipRelativeToStation.x) < (STATION_WIDTH/2 - STATION_WALL_THICKNESS);
+          yInBounds = shipRelativeToStation.y > 0 && shipRelativeToStation.y < STATION_HEIGHT;
+          zInBounds = Math.abs(shipRelativeToStation.z) < (STATION_LENGTH/2 - STATION_WALL_THICKNESS);
+        } else {
+          // When not docked, use exterior world bounds
+          // Station floor at Y=STATION_WALL_THICKNESS=2.0, ceiling at Y=STATION_HEIGHT-STATION_WALL_THICKNESS=58.0
+          xInBounds = Math.abs(shipRelativeToStation.x) < (STATION_WIDTH/2 - STATION_WALL_THICKNESS);
+          yInBounds = shipRelativeToStation.y > (STATION_WALL_THICKNESS - 0.1) && shipRelativeToStation.y < (STATION_HEIGHT - STATION_WALL_THICKNESS + 0.1);
+          zInBounds = Math.abs(shipRelativeToStation.z) < (STATION_LENGTH/2 - STATION_WALL_THICKNESS);
+        }
         
         isShipInDockingBay = xInBounds && yInBounds && zInBounds;
         
-        // Debug logging when docked to see position relative to station interior
-        if (isShipDocked && frameCount % 60 === 0) { // Every second
-          console.log('🔍 STATION INTERIOR BOUNDS CHECK (when docked):');
-          console.log('  Ship station-relative pos:', { x: shipRelativeToStation.x.toFixed(2), y: shipRelativeToStation.y.toFixed(2), z: shipRelativeToStation.z.toFixed(2) });
-          console.log('  Station interior bounds: X±98, Y(2-58), Z±123');
-          console.log('  X in bounds (±98):', xInBounds, '- value:', shipRelativeToStation.x.toFixed(2));
-          console.log('  Y in bounds (2-58):', yInBounds, '- value:', shipRelativeToStation.y.toFixed(2));
-          console.log('  Z in bounds (±123):', zInBounds, '- value:', shipRelativeToStation.z.toFixed(2));
-          console.log('  Overall in station:', isShipInDockingBay);
+        // Debug docking detection every few frames when ship is near station
+        const distanceToStation = Math.sqrt(
+          shipRelativeToStation.x * shipRelativeToStation.x + 
+          shipRelativeToStation.y * shipRelativeToStation.y + 
+          shipRelativeToStation.z * shipRelativeToStation.z
+        );
+        // Update previous state tracking
+        prevIsShipDocked = isShipDocked;
+        prevIsShipInDockingBay = isShipInDockingBay;
+        
+        // Reduced logging - only show status changes
+        if (frameCount % 120 === 0 && distanceToStation < 150) { // Every 2 seconds when near station
+          console.log('🚢 Ship status:', isShipDocked ? 'DOCKED' : (isShipInDockingBay ? 'IN DOCKING BAY' : 'EXTERIOR'));
         }
+        
         
         if (!isShipDocked && !pendingShipDocking) {
           // Ship docking logic
@@ -3068,96 +3450,33 @@
             pendingShipDocking = true;
           }
         } else if (isShipDocked) {
-          // Ship undocking logic - check if ship has moved outside docking bay
-          if (!isShipInDockingBay) {
-            console.log('SHIP UNDOCKING DETECTED (position-based) - Ship moved outside docking bay');
+          // Ship undocking logic - use same simple pattern as docking but with generous buffer
+          const undockBuffer = 5.0; // Extra room before undocking (prevents immediate undocking)
+          
+          const xOutOfBounds = Math.abs(shipRelativeToStation.x) > (STATION_WIDTH/2 - STATION_WALL_THICKNESS + undockBuffer);
+          const yOutOfBounds = shipRelativeToStation.y < (STATION_WALL_THICKNESS - 0.1 - undockBuffer) || shipRelativeToStation.y > (STATION_HEIGHT - STATION_WALL_THICKNESS + 0.1 + undockBuffer);
+          const zOutOfBounds = Math.abs(shipRelativeToStation.z) > (STATION_LENGTH/2 - STATION_WALL_THICKNESS + undockBuffer);
+          
+          if (xOutOfBounds || yOutOfBounds || zOutOfBounds) {
+            console.log('SHIP UNDOCKING DETECTED (position-based) - Ship moved outside generous docking bounds');
             console.log('  Ship station-relative pos:', { x: shipRelativeToStation.x.toFixed(2), y: shipRelativeToStation.y.toFixed(2), z: shipRelativeToStation.z.toFixed(2) });
-            console.log('  Ship world pos:', { x: shipPos.x.toFixed(2), y: shipPos.y.toFixed(2), z: shipPos.z.toFixed(2) });
+            console.log('  Generous bounds: X±' + (STATION_WIDTH/2 - STATION_WALL_THICKNESS + undockBuffer).toFixed(1) + 
+                       ', Y(' + (STATION_WALL_THICKNESS - undockBuffer).toFixed(1) + ' to ' + (STATION_HEIGHT - STATION_WALL_THICKNESS + undockBuffer).toFixed(1) + 
+                       '), Z±' + (STATION_LENGTH/2 - STATION_WALL_THICKNESS + undockBuffer).toFixed(1));
+            console.log('  Out of bounds check: X=' + xOutOfBounds + ', Y=' + yOutOfBounds + ', Z=' + zOutOfBounds);
             undockShip();
           }
         }
 
-        // Position-based ship entry detection (runs every frame) - check if ship is physically in station bounds
-        if (isInsideStation && !isInsideShip && !isExiting && !isTransitioning && !isEntering && !pendingShipEntryFromStation) {
-          const playerPos = stationPlayerBody.translation();
-          
-          // Check if ship is physically inside station bounds (regardless of docking status)
-          const shipPos = shipBody.translation(); // Use exterior ship position
-          const stationPos = stationBody.translation();
-          const shipRelativeToStation = {
-            x: shipPos.x - stationPos.x,
-            y: shipPos.y - stationPos.y,
-            z: shipPos.z - stationPos.z
-          };
-          
-          // Station interior bounds: ±99 X, 1-59 Y, ±124 Z (from original design)
-          const stationWidth = 200, stationHeight = 60, stationLength = 250;
-          const isShipPhysicallyInStation = Math.abs(shipRelativeToStation.x) < stationWidth/2 && 
-                                            shipRelativeToStation.y > -5 && shipRelativeToStation.y < stationHeight &&
-                                            Math.abs(shipRelativeToStation.z) < stationLength/2;
-          
-          if (!isShipPhysicallyInStation) {
-            // Skip ship entry detection if ship is not in station
-            if (frameCount % 120 === 0) { // Every 2 seconds
-              console.log('🔍 Ship not in station bounds, skipping ship entry detection');
-              console.log('  Ship pos:', {x: shipPos.x.toFixed(2), y: shipPos.y.toFixed(2), z: shipPos.z.toFixed(2)});
-              console.log('  Station pos:', {x: stationPos.x.toFixed(2), y: stationPos.y.toFixed(2), z: stationPos.z.toFixed(2)});
-              console.log('  Ship relative to station:', {x: shipRelativeToStation.x.toFixed(2), y: shipRelativeToStation.y.toFixed(2), z: shipRelativeToStation.z.toFixed(2)});
-            }
-          } else {
-            // Ship is physically inside station - calculate ship interior bounds relative to player
-            // Transform exterior ship position to station interior coordinates
-            const stationRot = stationBody.rotation();
-            const stationQuat = new THREE.Quaternion(stationRot.x, stationRot.y, stationRot.z, stationRot.w);
-            const stationQuatInverse = stationQuat.clone().invert();
-            
-            // Convert ship world position to station-relative position
-            const shipWorldRelative = new THREE.Vector3(
-              shipRelativeToStation.x, shipRelativeToStation.y, shipRelativeToStation.z
-            );
-            shipWorldRelative.applyQuaternion(stationQuatInverse);
-            
-            // Check if player is within ship interior bounds (station interior coordinates)
-            const relativeToShip = {
-              x: playerPos.x - shipWorldRelative.x,
-              y: playerPos.y - shipWorldRelative.y,
-              z: playerPos.z - shipWorldRelative.z
-            };
-          
-          // Ship interior bounds: width=20, height=6, length=30
-          // Floor is at Y=-0.4, ceiling at Y=5.6 (shipHeight-wallThickness), walls span this range
-          const shipWidth = 20, shipHeight = 6, shipLength = 30, wallThickness = 0.4;
-          const xInBounds = Math.abs(relativeToShip.x) < shipWidth/2;
-          const yInBounds = relativeToShip.y > (-wallThickness - 0.1) && relativeToShip.y < (shipHeight - wallThickness + 0.1); // Floor at -0.4, ceiling at 5.6
-          const zInBounds = Math.abs(relativeToShip.z) < shipLength/2;
-          const isPlayerInsideShipBounds = xInBounds && yInBounds && zInBounds;
-          
-            // Debug logging every few frames to see what's happening
-            if (frameCount % 60 === 0) { // Every 1 second at 60fps
-              console.log('🔍 Position-based ship entry check (ship in station):');
-              console.log('  Player pos in station:', {x: playerPos.x.toFixed(2), y: playerPos.y.toFixed(2), z: playerPos.z.toFixed(2)});
-              console.log('  Ship pos in station coords:', {x: shipWorldRelative.x.toFixed(2), y: shipWorldRelative.y.toFixed(2), z: shipWorldRelative.z.toFixed(2)});
-              console.log('  Player relative to ship:', {x: relativeToShip.x.toFixed(2), y: relativeToShip.y.toFixed(2), z: relativeToShip.z.toFixed(2)});
-              console.log('  Bounds check (width=20, height=6, length=30):', {
-                xOK: xInBounds, xValue: Math.abs(relativeToShip.x).toFixed(2), xLimit: (shipWidth/2).toFixed(2),
-                yOK: yInBounds, yValue: relativeToShip.y.toFixed(2), yRange: (-wallThickness - 0.1).toFixed(1) + ' to ' + (shipHeight - wallThickness + 0.1).toFixed(1),
-                zOK: zInBounds, zValue: Math.abs(relativeToShip.z).toFixed(2), zLimit: (shipLength/2).toFixed(2)
-              });
-              console.log('  Overall inside bounds:', isPlayerInsideShipBounds);
-              console.log('  Ship docked status:', isShipDocked, '(not required for entry)');
-            }
-            
-            if (isPlayerInsideShipBounds) {
-              console.log('🎯 SHIP ENTRY FROM STATION DETECTED (position-based):');
-              console.log('  Ship physically in station, player in ship bounds');
-              console.log('  Triggering ship entry transition...');
-              pendingShipEntryFromStation = true;
-            }
-          }
-        }
+        // Position-based ship entry detection disabled - rely only on sensor-based detection
+        // The sensor attached to the ship body will handle entry detection more accurately
+
+        // Position-based ship entry detection from station disabled - rely only on sensor-based detection
         
         // Position-based station exit detection (similar to ship exit logic)
-        if (isInsideStation && !isInsideShip && !isExiting && !isTransitioning && !isEntering) {
+        // Add small delay after entry to prevent immediate exit
+        const timeSinceStationEntry = Date.now() - (lastStationEntryTime || 0);
+        if (isInsideStation && !isInsideShip && !isExiting && !isTransitioning && !isEntering && timeSinceStationEntry > 500) {
           const stationPlayerPos = stationPlayerBody.translation();
           const stationPos = stationBody.translation();
           
@@ -3169,20 +3488,20 @@
           };
           
           // Station interior bounds (larger than ship)
-          const stationWidth = 200, stationHeight = 60, stationLength = 250;  // Full interior dimensions
-          const isPlayerOutsideStationBounds = Math.abs(relativeToStation.x) > stationWidth/2 || 
-                                               relativeToStation.y < -5 || relativeToStation.y > stationHeight ||
-                                               Math.abs(relativeToStation.z) > stationLength/2;
+          // Use global constants - full interior dimensions
+          const isPlayerOutsideStationBounds = Math.abs(relativeToStation.x) > STATION_WIDTH/2 || 
+                                               relativeToStation.y < -5 || relativeToStation.y > STATION_HEIGHT ||
+                                               Math.abs(relativeToStation.z) > STATION_LENGTH/2;
           
           // Debug logging for station exit (less frequent)
           if (frameCount % 120 === 0) { // Every 2 seconds
             console.log('🚪 Position-based station exit check:');
             console.log('  Player pos in station:', {x: relativeToStation.x.toFixed(2), y: relativeToStation.y.toFixed(2), z: relativeToStation.z.toFixed(2)});
-            console.log('  Station bounds (W×H×L):', stationWidth, '×', stationHeight, '×', stationLength);
+            console.log('  Station bounds (W×H×L):', STATION_WIDTH, '×', STATION_HEIGHT, '×', STATION_LENGTH);
             console.log('  Outside bounds?', {
-              xOut: Math.abs(relativeToStation.x) > stationWidth/2,
-              yOut: relativeToStation.y < -5 || relativeToStation.y > stationHeight,
-              zOut: Math.abs(relativeToStation.z) > stationLength/2,
+              xOut: Math.abs(relativeToStation.x) > STATION_WIDTH/2,
+              yOut: relativeToStation.y < -5 || relativeToStation.y > STATION_HEIGHT,
+              zOut: Math.abs(relativeToStation.z) > STATION_LENGTH/2,
               overall: isPlayerOutsideStationBounds
             });
           }
@@ -3196,45 +3515,12 @@
         
         if (pendingShipEntryFromStation && !isEntering) {
           pendingShipEntryFromStation = false;
-          console.log('🎯 PROCESSING DEFERRED SHIP ENTRY FROM STATION - Calling enterShipFromStation()');
           enterShipFromStation();
-        } else if (pendingShipEntryFromStation && isEntering) {
-          console.log('⏳ Ship entry from station pending but isEntering=true, waiting...');
         }
         
-        // Debug player state every few seconds
-        if (frameCount % 300 === 0) { // Every ~5 seconds at 60fps
-          console.log('🎮 PLAYER STATE DEBUG:', {
-            isInsideShip,
-            isInsideStation, 
-            isEntering,
-            isExiting,
-            isTransitioning,
-            frameCount
-          });
-          
-          // Debug station ship entry position
-          if (isInsideStation && isShipDocked) {
-            const playerPos = stationPlayerBody.translation();
-            const shipPos = stationShipBody.translation();
-            console.log('🚪 STATION SHIP ENTRY DEBUG:');
-            console.log('  Player position:', {x: playerPos.x.toFixed(2), y: playerPos.y.toFixed(2), z: playerPos.z.toFixed(2)});
-            console.log('  Ship position:', {x: shipPos.x.toFixed(2), y: shipPos.y.toFixed(2), z: shipPos.z.toFixed(2)});
-            
-            // Calculate relative position for bounds checking
-            const relativeToShip = {
-              x: playerPos.x - shipPos.x,
-              y: playerPos.y - shipPos.y,
-              z: playerPos.z - shipPos.z
-            };
-            console.log('  Player relative to ship:', {x: relativeToShip.x.toFixed(2), y: relativeToShip.y.toFixed(2), z: relativeToShip.z.toFixed(2)});
-            console.log('  Within ship bounds?', {
-              xOK: Math.abs(relativeToShip.x) < 10,
-              yOK: relativeToShip.y > -1 && relativeToShip.y < 6,
-              zOK: Math.abs(relativeToShip.z) < 15
-            });
-          }
-        }
+        
+        // Update physics-based proxy detection
+        detectActiveProxyFromPhysics();
         
         updatePlayer(deltaTime);
         updateShip(deltaTime);
@@ -3354,15 +3640,19 @@
     renderer.setViewport(width / 3, 0, width / 3, height);
     renderer.setScissor(width / 3, 0, width / 3, height);
     
-    // Show ship interior proxy and hide exterior meshes
+    // Context-aware rendering for middle viewport
+    // When player is in ship (whether docked or not), show ship interior
+    // When player is just in station (not in ship), this viewport still shows ship for reference
+    const showShipInteriorInMiddle = playerProxyContext.activeWorld === 'ship' || !isInsideStation;
+    
     shipMesh.visible = false;
     stationMesh.visible = false;
-    shipInteriorProxy.visible = true;
-    stationInteriorProxy.visible = false;
+    shipInteriorProxy.visible = showShipInteriorInMiddle;
+    stationInteriorProxy.visible = !showShipInteriorInMiddle;
     
-    // Show debug player mesh based on transition progress and if positioned correctly
+    // Show debug player mesh based on context
     const interiorPos = interiorPlayerBody.translation();
-    const shouldShowDebugPlayer = (isInsideShip || (isTransitioning && transitionProgress > 0.3)) && interiorPos.y > -50;
+    const shouldShowDebugPlayer = (playerProxyContext.activeWorld === 'ship' || (isTransitioning && transitionProgress > 0.3)) && interiorPos.y > -50;
     
     if (shouldShowDebugPlayer) {
       debugPlayerMesh.position.set(interiorPos.x, interiorPos.y, interiorPos.z);
@@ -3371,21 +3661,26 @@
       debugPlayerMesh.visible = false;
     }
     
-    renderer.render(interiorScene, interiorCamera);
+    // Render the appropriate scene based on what we're showing
+    if (showShipInteriorInMiddle) {
+      renderer.render(interiorScene, interiorCamera);
+    } else {
+      renderer.render(stationScene, stationCamera);
+    }
     
-    // Right viewport - Station Interior world view
+    // Right viewport - Station Interior world view (ALWAYS shows station)
     renderer.setViewport(2 * width / 3, 0, width / 3, height);
     renderer.setScissor(2 * width / 3, 0, width / 3, height);
     
-    // Show station interior proxy and hide exterior meshes
+    // Always show station interior in the right viewport
     shipMesh.visible = false;
     stationMesh.visible = false;
     shipInteriorProxy.visible = false;
     stationInteriorProxy.visible = true;
     
-    // Show debug station player mesh if in station
+    // Show debug station player mesh only if player is in station (not in docked ship)
     const stationPos = stationPlayerBody.translation();
-    const shouldShowStationPlayer = isInsideStation && stationPos.y > -150;
+    const shouldShowStationPlayer = playerProxyContext.activeWorld === 'station' && stationPos.y > -150;
     
     if (shouldShowStationPlayer) {
       debugStationPlayerMesh.position.set(stationPos.x, stationPos.y, stationPos.z);
@@ -3394,7 +3689,7 @@
       debugStationPlayerMesh.visible = false;
     }
     
-    // Ensure ship proxy visibility is correct based on docking state
+    // Show docked ship proxy in station view if ship is docked
     if (stationShipProxy) {
       stationShipProxy.visible = isShipDocked;
     }
@@ -3478,6 +3773,14 @@
   <div class="debug-row">
     <span class="label">Inside Ship:</span>
     <span class="value">{isInsideShip ? 'YES' : 'NO'}</span>
+  </div>
+  <div class="debug-row">
+    <span class="label">Proxy Hierarchy:</span>
+    <span class="value">{proxyHierarchy}</span>
+  </div>
+  <div class="debug-row">
+    <span class="label">Active World:</span>
+    <span class="value">{playerProxyContext.activeWorld}</span>
   </div>
 </div>
 
